@@ -366,10 +366,11 @@ func (db *Database) parsePlaylistTree(data []byte, pageSize, firstPage, lastPage
 			return
 		}
 		db.PlaylistTree = append(db.PlaylistTree, &FolderNode{
-			ID:       id,
-			ParentID: parentID,
-			Name:     name,
-			IsFolder: isFolder,
+			ID:        id,
+			ParentID:  parentID,
+			Name:      name,
+			IsFolder:  isFolder,
+			SortOrder: le32(row, 8),
 		})
 	})
 }

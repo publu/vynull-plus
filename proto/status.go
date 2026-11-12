@@ -502,6 +502,14 @@ func MarshalMySettingsResponse(name string, deviceNumber uint8, slot uint8, mySe
 // MarshalLoadTrackCommand builds a "load track" command (type 0x19, 88 bytes).
 // Sent to a CDJ on port 50002 to remotely load a track.
 func MarshalLoadTrackCommand(name string, deviceNumber uint8, slot uint8, targetDevice uint8, trackID uint32) []byte {
+	return MarshalLoadTrackCommandFrom(name, deviceNumber, deviceNumber, slot, targetDevice, trackID)
+}
+
+// MarshalLoadTrackCommandFrom builds a 0x19 load command telling the target
+// deck to load trackID from sourceDevice's media in sourceSlot (e.g. another
+// CDJ's USB, slot 3), sent by deviceNumber. MarshalLoadTrackCommand is the
+// special case where the source is us.
+func MarshalLoadTrackCommandFrom(name string, deviceNumber, sourceDevice, slot, targetDevice uint8, trackID uint32) []byte {
 	buf := make([]byte, 88)
 	PutHeader(buf, 0x19)
 	putName50002(buf, name)
@@ -513,7 +521,7 @@ func MarshalLoadTrackCommand(name string, deviceNumber uint8, slot uint8, target
 	buf[0x23] = 0x34 // remaining length (52)
 	buf[0x24] = deviceNumber
 	buf[0x25] = 0x00
-	buf[0x28] = deviceNumber
+	buf[0x28] = sourceDevice
 	buf[0x29] = slot
 	buf[0x2a] = 0x01 // always 1 (deck number, not target device — target is via dest IP)
 	buf[0x2b] = 0x00

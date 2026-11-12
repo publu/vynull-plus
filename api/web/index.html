@@ -20,6 +20,8 @@
 <link rel="stylesheet" href="/css/diag.css">
 <link rel="stylesheet" href="/css/toast.css">
 <link rel="stylesheet" href="/css/mobile.css">
+<link rel="stylesheet" href="/css/review.css">
+<link rel="stylesheet" href="/css/usb.css">
 <script>
   // Apply the saved theme before first paint to avoid a flash of the default.
   try { document.documentElement.dataset.theme = localStorage.getItem('theme') || 'dark'; } catch (e) {}
@@ -50,6 +52,7 @@
 <nav class="tabs">
   <div class="tab active" data-tab="players"><span class="tick">◢</span>PLAYERS</div>
   <div class="tab" data-tab="library"><span class="tick">◢</span>LIBRARY</div>
+  <div class="tab" data-tab="usb"><span class="tick">◢</span>USB</div>
   <div class="tab" data-tab="tags"><span class="tick">◢</span>TAGS</div>
   <div class="tab" data-tab="settings"><span class="tick">◢</span>SETTINGS</div>
   <div class="tab" data-tab="diag"><span class="tick">◢</span>DIAG</div>
@@ -105,6 +108,22 @@
         <div class="lib-filterbar" id="lib-filterbar"></div>
         <div id="library-content"><div class="empty-state">LOADING</div></div>
       </div>
+    </div>
+  </section>
+
+  <section id="usb" class="panel">
+    <div class="usb-toolbar">
+      <div class="usb-sources" id="usb-sources"></div>
+      <div class="input-wrap">
+        <input type="text" id="usb-search" class="input" placeholder="SEARCH USB — TITLE, ARTIST, ALBUM, GENRE, KEY, BPM…" autocomplete="off" spellcheck="false">
+        <button type="button" id="usb-search-clear" class="input-clear" title="Clear search">×</button>
+      </div>
+      <button type="button" id="usb-refresh" class="lib-tool-btn" title="Re-read the stick (after swapping USBs)">↻ RESCAN</button>
+      <div class="lib-stats" id="usb-stats"></div>
+    </div>
+    <div class="usb-layout">
+      <aside class="usb-sidebar" id="usb-sidebar"></aside>
+      <div class="usb-main" id="usb-content"><div class="empty-state">LOOKING FOR USB STICKS…</div></div>
     </div>
   </section>
 
@@ -198,5 +217,7 @@
 <script src="/js/export.js"></script>
 <script src="/js/smart-playlists.js"></script>
 <script src="/js/poll.js"></script>
+<script src="/js/review.js"></script>
+<script src="/js/usb.js"></script>
 </body>
 </html>

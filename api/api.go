@@ -9,6 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +55,11 @@ type Server struct {
 	// deck plays from another player's media (from package mediadb). nil until
 	// cached; the /api/analysis/ext endpoint 404s and the UI retries.
 	ExtAnalysis func(player, slot uint8, trackID uint32) *mediadb.Analysis
+
+	// ExtMedia, if set, returns the database of a player's USB/SD (slot 3/2)
+	// downloaded over NFS, for the USB tab's browse/search. Non-blocking: see
+	// mediadb.Fetcher.Media.
+	ExtMedia func(player, slot uint8, refresh bool) (*pdb.Database, string, mediadb.MediaState)
 
 	// Set on first Start(); used by the diagnostic endpoints.
 	started time.Time
@@ -121,6 +129,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/import/status", s.handleImportStatus)
 	mux.HandleFunc("/api/library/remap-paths", s.handleRemapPaths)
 	mux.HandleFunc("/api/load", s.handleLoadTrack)
+	mux.HandleFunc("/api/media", s.handleMedia)
+	mux.HandleFunc("/api/media/tracks", s.handleMediaTracks)
+	mux.HandleFunc("/api/media/load", s.handleMediaLoad)
+	// Optional companion service (review/dj_review.py): suggestions, request
+	// queue and mix previews. Override with VYNULL_REVIEW_URL.
+	reviewAddr := os.Getenv("VYNULL_REVIEW_URL")
+	if reviewAddr == "" {
+		reviewAddr = "http://127.0.0.1:9444"
+	}
+	reviewURL, _ := url.Parse(reviewAddr)
+	mux.Handle("/api/review/", httputil.NewSingleHostReverseProxy(reviewURL))
 
 	mux.HandleFunc("/api/diag", s.handleDiag)
 	mux.HandleFunc("/api/diag/logs", s.handleDiagLogs)

@@ -423,3 +423,42 @@ func (f *Fetcher) doFetchAnalysis(player uint8, export string, db *pdb.Database,
 		player, trackID, len(a.WaveDetail), len(a.Cues), len(a.Beats))
 	return a
 }
+
+// MediaState describes how far along a media's database download is.
+type MediaState string
+
+const (
+	MediaLoading     MediaState = "loading"     // download in flight, nothing cached yet
+	MediaReady       MediaState = "ready"       // database cached
+	MediaUnavailable MediaState = "unavailable" // last download failed (no media in the slot, or unreachable)
+)
+
+// Media returns the cached database for a player's media slot along with its
+// state and the NFS export it came from. Like Get, it never blocks: a miss (or
+// a stale/failed entry past its cooldown) starts a background download. With
+// refresh set, a fresh download is started even if a copy is cached (the stale
+// copy is still served meanwhile) — for a USB that was swapped.
+func (f *Fetcher) Media(player, slot uint8, refresh bool) (*pdb.Database, string, MediaState) {
+	if slot == slotCD {
+		return nil, "", MediaUnavailable
+	}
+	k := key(player, slot)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	e, ok := f.cache[k]
+	stale := ok && e.db != nil && time.Since(e.at) >= successTTL
+	failedRecently := ok && e.db == nil && time.Since(e.at) < failCooldown
+	needFetch := !ok || stale || refresh || (e.db == nil && !failedRecently)
+	if needFetch && !f.inflight[k] {
+		f.inflight[k] = true
+		go f.fetch(k, player, slot)
+	}
+	switch {
+	case ok && e.db != nil:
+		return e.db, e.export, MediaReady
+	case f.inflight[k]:
+		return nil, "", MediaLoading
+	default:
+		return nil, "", MediaUnavailable
+	}
+}

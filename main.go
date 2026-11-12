@@ -695,6 +695,7 @@ func main() {
 		CacheDir:     cfg.DataDir, // for rendered waveform PNGs etc.
 		ExtArtwork:   extMeta.Artwork,
 		ExtAnalysis:  extMeta.Analysis,
+		ExtMedia:     extMeta.Media,
 		Overlay:      api.NewOverlayStore(filepath.Join(cfg.DataDir, "overlay.json")),
 	}
 	if cfg.Web {

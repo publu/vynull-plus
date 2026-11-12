@@ -17,6 +17,9 @@ type FolderNode struct {
 	IsFolder bool // true=contains subfolders, false=leaf playlist
 	Children []*FolderNode
 	TrackIDs []uint32 // tracks directly in this folder
+	// SortOrder is the node's position among its siblings, as read from a
+	// rekordbox export (0 when built locally).
+	SortOrder uint32
 }
 
 // BuildFolderTree creates a folder/playlist tree from track file paths.

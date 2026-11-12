@@ -101,6 +101,13 @@ func logTrack(id uint32, name string) string {
 // has a proper NFS mount context for file access.
 // name is the track's display title, used only in logs (pass "" if unknown).
 func (d *VirtualDevice) LoadTrackOnCDJ(trackID uint32, name string, targetDevice uint8, targetIP net.IP) error {
+	return d.LoadTrackFromOnCDJ(d.DeviceNumber, d.MediaSlot, trackID, name, targetDevice, targetIP)
+}
+
+// LoadTrackFromOnCDJ is LoadTrackOnCDJ for a track on another source's media:
+// it tells the target deck to load trackID from sourceDevice's sourceSlot
+// (e.g. the USB, slot 3, in another CDJ).
+func (d *VirtualDevice) LoadTrackFromOnCDJ(sourceDevice, sourceSlot uint8, trackID uint32, name string, targetDevice uint8, targetIP net.IP) error {
 	if d.statusConn == nil {
 		return fmt.Errorf("status connection not ready")
 	}
@@ -116,7 +123,7 @@ func (d *VirtualDevice) LoadTrackOnCDJ(trackID uint32, name string, targetDevice
 	// its NFS mount and led to 0x1c "media unavailable" rejection of
 	// the subsequent load command (especially common after a track
 	// played out to the ENDED state).
-	pkt := proto.MarshalLoadTrackCommand(d.Name, d.DeviceNumber, d.MediaSlot, targetDevice, trackID)
+	pkt := proto.MarshalLoadTrackCommandFrom(d.Name, d.DeviceNumber, sourceDevice, sourceSlot, targetDevice, trackID)
 	// Duplicate pair matches the 0x19 send pattern (two
 	// copies <1ms apart).
 	if _, err := d.sendStatus(pkt, addr); err != nil {

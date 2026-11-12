@@ -1,0 +1,35 @@
+#usb .usb-toolbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+#usb .usb-toolbar .input-wrap{flex:1;min-width:220px}
+#usb .usb-sources{display:flex;gap:6px;flex-wrap:wrap}
+#usb .usb-src{font:11px var(--font-mono,monospace);letter-spacing:1px;background:transparent;color:var(--text2);border:1px solid var(--wire);padding:7px 10px;cursor:pointer;display:flex;gap:8px}
+#usb .usb-src.active,#usb .usb-src:hover{color:var(--orange);border-color:var(--orange)}
+#usb .usb-src .count{opacity:.7}
+#usb .usb-table-wrap{overflow:auto;max-height:calc(100vh - 230px);border:1px solid var(--wire)}
+#usb .usb-table{width:100%;border-collapse:collapse;font:12px var(--font-mono,monospace)}
+#usb .usb-table th{position:sticky;top:0;background:var(--panel2);text-align:left;font-weight:600;font-size:10px;letter-spacing:1px;color:var(--text2);padding:8px;cursor:pointer;white-space:nowrap;border-bottom:1px solid var(--wire)}
+#usb .usb-table th.sorted{color:var(--orange)}
+#usb .usb-table td{padding:6px 8px;border-bottom:1px solid var(--rail);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px}
+#usb .usb-table tr:hover td{background:rgba(255,121,0,.05)}
+#usb .usb-table tr.on-deck td{background:rgba(255,121,0,.09)}
+#usb .usb-table td.num{text-align:right;font-variant-numeric:tabular-nums}
+#usb .usb-table td.t-title{color:var(--text);font-weight:600}
+#usb .usb-muted{color:var(--text2)}
+#usb .usb-actions{display:flex;gap:4px}
+#usb .usb-load{font:10px var(--font-mono,monospace);background:transparent;color:var(--text2);border:1px solid var(--wire);padding:3px 6px;cursor:pointer}
+#usb .usb-load:hover{color:var(--orange);border-color:var(--orange)}
+#usb .usb-deck-chip{font-size:9px;color:var(--orange);border:1px solid var(--orange);padding:0 4px;margin-left:6px;font-weight:400}
+#usb .usb-more{padding:10px;font:10px var(--font-mono,monospace);letter-spacing:1px;color:var(--text2)}
+#usb .usb-layout{display:flex;gap:14px;align-items:flex-start}
+#usb .usb-main{flex:1;min-width:0}
+#usb .usb-sidebar{width:240px;flex:none;max-height:calc(100vh - 230px);overflow:auto;border:1px solid var(--wire);background:var(--panel)}
+#usb .usb-sidebar:empty{display:none}
+#usb .usb-pl{display:flex;align-items:center;gap:8px;width:100%;text-align:left;font:11px var(--font-mono,monospace);background:transparent;color:var(--text2);border:0;border-bottom:1px solid var(--rail);padding:7px 10px;cursor:pointer}
+#usb .usb-pl .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#usb .usb-pl .count{opacity:.6;font-size:10px}
+#usb .usb-pl .icon{width:12px;flex:none;color:var(--text3)}
+#usb .usb-pl:hover{color:var(--text)}
+#usb .usb-pl.active{color:var(--orange);background:var(--sel-bg)}
+#usb .usb-pl.folder{color:var(--text)}
+#usb .usb-side-head{font:10px var(--font-mono,monospace);letter-spacing:2px;color:var(--text3);padding:12px 10px 6px}
+#usb .usb-side-empty{font:10px var(--font-mono,monospace);padding:8px 10px}
+@media(max-width:800px){#usb .usb-layout{flex-direction:column}#usb .usb-sidebar{width:100%;max-height:200px}}
