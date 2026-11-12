@@ -1,0 +1,313 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package api
+
+import (
+	"math"
+	"strings"
+	"time"
+
+	"github.com/vynulldev/vynull/library"
+)
+
+// rbFieldMap maps rekordbox SmartList PropertyName values to the app's
+// SmartRules field names. The names are rekordbox's own, as its property
+// vocabulary probe shows (link-spec conformance suite smart-property-matrix,
+// rekordbox 7.2.19): it accepts counter (play count), remixedBy, fileName
+// (or filename), and mixName, and rejects look-alikes such as playCount,
+// remixer, title, color, and composer. Properties not listed are unsupported
+// (or, like albumArtist, producer, and grouping, have no track data here); their conditions are dropped during translation.
+var rbFieldMap = map[string]string{
+	"bpm":            "bpm",
+	"genre":          "genre",
+	"artist":         "artist",
+	"album":          "album",
+	"name":           "title",
+	"comments":       "comment",
+	"label":          "label",
+	"remixedBy":      "remixer",
+	"originalArtist": "original_artist",
+	"key":            "key",
+	"rating":         "rating",
+	"year":           "year",
+	"counter":        "play_count",
+	"duration":       "duration_sec",
+	"fileType":       "file_type",
+	"fileName":       "file_name",
+	"filename":       "file_name",
+	"mixName":        "mix_name",
+	"albumArtist":    "album_artist",
+	"producer":       "composer",
+	"myTag":          "tag",
+	"stockDate":      "date_added",
+	"dateCreated":    "date_created",
+	"dateReleased":   "release_date",
+}
+
+// rbField looks up a SmartList PropertyName, which rekordbox matches in any
+// letter case (smart-xml-matrix, rekordbox 7.2.19: GENRE works as genre).
+func rbField(property string) (string, bool) {
+	if field, ok := rbFieldMap[property]; ok {
+		return field, true
+	}
+	for name, field := range rbFieldMap {
+		if strings.EqualFold(name, property) {
+			return field, true
+		}
+	}
+	return "", false
+}
+
+func isNumericField(field string) bool {
+	switch field {
+	case "bpm", "year", "rating", "play_count", "duration_sec", "color":
+		return true
+	}
+	return false
+}
+
+// rbDate converts a rekordbox SmartList date value to the RFC3339 form
+// dateMatch expects, or "" if rekordbox would not accept it (so the caller
+// treats the condition as unsatisfiable). rekordbox reads rule dates as it
+// reads track dates; see library.ParseRekordboxDate.
+func rbDate(s string) string {
+	t := library.ParseRekordboxDate(s)
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
+}
+
+// rbRecent translates in-last (6) and not-in-last (7). rekordbox counts
+// calendar months only for the unit month, in any case; every other unit,
+// week and year included, counts days (smart-relative-date-matrix,
+// rekordbox 7.2.19). The right-hand value is ignored.
+func rbRecent(field string, c library.RBSmartCond) SmartCond {
+	op := "in_last_days"
+	if strings.EqualFold(c.Unit, "month") {
+		op = "in_last_months"
+	}
+	if c.Operator == 7 {
+		op = "not_" + op
+	}
+	return SmartCond{Field: field, Operator: op, Value: float64(rbInt(c.Left))}
+}
+
+// rbInt reads a numeric rule value as rekordbox does (link-spec
+// smart-numeric-matrix and smart-numeric-boundaries, rekordbox 7.2.19): an
+// optionally signed run of leading digits, so 0.5 is 0 and blank or other
+// text is 0, saturating at the int32 limits. Relative-date counts read the
+// same way.
+func rbInt(s string) int64 {
+	s = strings.TrimLeft(s, " \t\r\n")
+	neg := false
+	if s != "" && (s[0] == '-' || s[0] == '+') {
+		neg = s[0] == '-'
+		s = s[1:]
+	}
+	var n int64
+	for i := 0; i < len(s) && s[i] >= '0' && s[i] <= '9'; i++ {
+		if n = n*10 + int64(s[i]-'0'); n > math.MaxInt32+1 {
+			n = math.MaxInt32 + 1
+		}
+	}
+	if neg {
+		return max(-n, math.MinInt32)
+	}
+	return min(n, math.MaxInt32)
+}
+
+// smartRulesFromRekordbox translates a parsed rekordbox SmartList into the
+// app's SmartRules. Returns the rules and the number of conditions that
+// could not be mapped (unsupported property/operator) so the caller can log
+// partial translations. A smart playlist with all conditions dropped becomes
+// an empty rule set — which matches every track — so the caller treats a
+// fully-dropped translation as "don't create a smart playlist".
+func smartRulesFromRekordbox(rb *library.RBSmartList) (rules *SmartRules, mapped, dropped int) {
+	if rb == nil {
+		return nil, 0, 0
+	}
+	sr := &SmartRules{Combinator: "all"}
+	if rb.Logical == 2 {
+		sr.Combinator = "any"
+	}
+	for _, c := range rb.Conditions {
+		if cond, ok := rbCondToSmart(c); ok {
+			sr.Conditions = append(sr.Conditions, cond)
+			mapped++
+		} else {
+			dropped++
+		}
+	}
+	return sr, mapped, dropped
+}
+
+// rbCondToSmart maps a single rekordbox condition to a SmartCond. The second
+// return is false when the property or operator isn't supported.
+//
+// rekordbox operator codes: 1=equal, 2=not-equal, 3=greater, 4=less,
+// 5=in-range, 6=in-last, 7=not-in-last, 8=contains, 9=not-contains, 10=starts-with,
+// 11=ends-with. BPM values are stored ×100; myTag values arrive already
+// resolved to the tag name by the dump helper.
+func rbCondToSmart(c library.RBSmartCond) (SmartCond, bool) {
+	field, ok := rbField(c.Property)
+	if !ok {
+		return SmartCond{}, false
+	}
+	isTag := field == "tag"
+	isDate := field == "date_added" || field == "date_created" || field == "release_date"
+	isNum := isNumericField(field)
+
+	// num parses a rekordbox numeric value string, scaling BPM down by 100.
+	num := func(s string) float64 {
+		f := float64(rbInt(s))
+		if field == "bpm" {
+			f /= 100
+		}
+		return f
+	}
+
+	// contains, starts-with, and ends-with an empty value match nothing in
+	// rekordbox (equality with "" still finds empty fields).
+	if !isTag && !isNum && !isDate && (c.Operator == 8 || c.Operator == 10 || c.Operator == 11) && c.Left == "" {
+		return SmartCond{}, false
+	}
+
+	// rekordbox evaluates MyTag conditions only with contains and
+	// not-contains, and a blank tag matches nothing.
+	if isTag && (c.Operator != 8 && c.Operator != 9 || strings.TrimSpace(c.Left) == "") {
+		return SmartCond{}, false
+	}
+
+	switch c.Operator {
+	case 1: // EQUAL
+		switch {
+		case isTag:
+			return SmartCond{Field: "tag", Operator: "has", Value: c.Left}, true
+		case isNum:
+			return SmartCond{Field: field, Operator: "eq", Value: num(c.Left)}, true
+		case isDate:
+			// Same calendar day. A blank or invalid date matches nothing.
+			if d := rbDate(c.Left); d != "" {
+				return SmartCond{Field: field, Operator: "on", Value: d}, true
+			}
+			return SmartCond{}, false
+		default:
+			return SmartCond{Field: field, Operator: "is", Value: c.Left}, true
+		}
+	case 2: // NOT_EQUAL
+		switch {
+		case isTag:
+			return SmartCond{Field: "tag", Operator: "not_has", Value: c.Left}, true
+		case isNum:
+			return SmartCond{Field: field, Operator: "ne", Value: num(c.Left)}, true
+		case isDate:
+			// Any other day; against a blank or invalid date, rekordbox
+			// matches every track that has a date.
+			if d := rbDate(c.Left); d != "" {
+				return SmartCond{Field: field, Operator: "not_on", Value: d}, true
+			}
+			return SmartCond{Field: field, Operator: "not_empty"}, true
+		default:
+			return SmartCond{Field: field, Operator: "is_not", Value: c.Left}, true
+		}
+	case 3: // GREATER (after, for dates)
+		if isDate {
+			if d := rbDate(c.Left); d != "" {
+				return SmartCond{Field: field, Operator: "after", Value: d}, true
+			}
+			return SmartCond{}, false
+		}
+		if isNum {
+			return SmartCond{Field: field, Operator: "gt", Value: num(c.Left)}, true
+		}
+	case 4: // LESS (before, for dates)
+		if isDate {
+			if d := rbDate(c.Left); d != "" {
+				return SmartCond{Field: field, Operator: "before", Value: d}, true
+			}
+			return SmartCond{}, false
+		}
+		if isNum {
+			return SmartCond{Field: field, Operator: "lt", Value: num(c.Left)}, true
+		}
+	case 5: // IN_RANGE
+		// A reversed range (low above high) matches nothing in rekordbox.
+		if isDate {
+			if lo, hi := rbDate(c.Left), rbDate(c.Right); lo != "" && hi != "" && lo <= hi {
+				return SmartCond{Field: field, Operator: "between", Value: []any{lo, hi}}, true
+			}
+			return SmartCond{}, false
+		}
+		if isNum {
+			if lo, hi := num(c.Left), num(c.Right); lo <= hi {
+				return SmartCond{Field: field, Operator: "between", Value: []any{lo, hi}}, true
+			}
+			return SmartCond{}, false
+		}
+	case 6, 7: // IN_LAST, NOT_IN_LAST (relative date)
+		if isDate {
+			return rbRecent(field, c), true
+		}
+	case 8: // CONTAINS
+		switch {
+		case isTag:
+			return SmartCond{Field: "tag", Operator: "has", Value: c.Left}, true
+		case isNum:
+			return SmartCond{Field: field, Operator: "eq", Value: num(c.Left)}, true
+		default:
+			return SmartCond{Field: field, Operator: "contains", Value: c.Left}, true
+		}
+	case 9: // NOT_CONTAINS
+		if isTag {
+			return SmartCond{Field: "tag", Operator: "not_has", Value: c.Left}, true
+		}
+		return SmartCond{Field: field, Operator: "not_contains", Value: c.Left}, true
+	case 10: // STARTS_WITH
+		if !isNum && !isTag {
+			return SmartCond{Field: field, Operator: "starts_with", Value: c.Left}, true
+		}
+	case 11: // ENDS_WITH
+		if !isNum && !isTag {
+			return SmartCond{Field: field, Operator: "ends_with", Value: c.Left}, true
+		}
+	}
+	return SmartCond{}, false
+}
+
+// RekordboxSmartTracks evaluates a rekordbox smart-playlist rule set (as
+// dumped from master.db) against the library, exactly as an imported smart
+// playlist is evaluated: the rules are translated by the import's own
+// smartRulesFromRekordbox, then matched like PlaylistStore.TracksFor does.
+// For callers that serve a dump without importing it into a PlaylistStore,
+// such as the conformance server.
+func RekordboxSmartTracks(rb *library.RBSmartList, lib *library.Library, tags TagLookup, now time.Time) []uint32 {
+	if rbMatchesNothing(rb) {
+		return nil
+	}
+	rules, _, _ := smartRulesFromRekordbox(rb)
+	return matchingTracks(rules, lib, tags, now)
+}
+
+// rbMatchesNothing reports whether rekordbox would select no tracks for a
+// smart playlist's rule set (link-spec conformance smart suites, rekordbox
+// 7.2.19): a smart playlist without rules or with an empty rule set, or an
+// all-of rule set with any condition rekordbox cannot satisfy (an unknown
+// property, an operator that doesn't apply to the property, a reversed
+// range, an unparseable date). Translation drops such conditions, which in an
+// all-of set would wrongly widen the match; in an any-of set dropping them is
+// already right, since they never match.
+func rbMatchesNothing(rb *library.RBSmartList) bool {
+	if rb == nil || len(rb.Conditions) == 0 {
+		return true
+	}
+	if rb.Logical == 2 {
+		return false
+	}
+	for _, c := range rb.Conditions {
+		if _, ok := rbCondToSmart(c); !ok {
+			return true
+		}
+	}
+	return false
+}

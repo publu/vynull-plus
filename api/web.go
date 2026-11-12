@@ -1,0 +1,159 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package api
+
+import (
+	"crypto/sha256"
+	"embed"
+	"encoding/hex"
+	"io/fs"
+	"net/http"
+	"strings"
+
+	apidocs "github.com/vynulldev/vynull/docs/api"
+)
+
+// registerAPIDocs serves the API's own documentation, always (not gated on
+// --web) so the HTTP API is self-describing: the OpenAPI spec at
+// /api/openapi.yaml, a browsable self-hosted Swagger UI at /api/docs, and its
+// vendored assets under /api/swagger/. No CDN dependency — works offline.
+func registerAPIDocs(mux *http.ServeMux) {
+	mux.HandleFunc("/api/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/yaml")
+		w.Write(apidocs.Spec)
+	})
+	mux.HandleFunc("/api/docs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(apidocs.DocsHTML)
+	})
+	swaggerSub, _ := fs.Sub(apidocs.SwaggerFS, "swagger")
+	mux.Handle("/api/swagger/", http.StripPrefix("/api/swagger/", http.FileServer(http.FS(swaggerSub))))
+}
+
+//go:embed web/index.html
+var webIndexHTML []byte
+
+// The page's stylesheets and scripts, one file per feature, linked from
+// index.html in the order they apply.
+//
+//go:embed web/css/*.css web/js/*.js
+var webAssetsFS embed.FS
+
+//go:embed web/overlay.html
+var webOverlayHTML []byte
+
+//go:embed web/favicon.svg
+var webFaviconSVG []byte
+
+// PWA manifest + icons: lets browsers install the web UI as a standalone
+// app (fullscreen from a home-screen icon on phones/tablets, its own window
+// on desktop). No service worker on purpose — the UI is meaningless without
+// the live server, so offline caching would only mislead.
+//
+//go:embed web/manifest.json
+var webManifestJSON []byte
+
+//go:embed web/icon-192.png web/icon-512.png
+var webIconsFS embed.FS
+
+// webFontsFS holds the self-hosted woff2 fonts (Geist Mono + VT323), served at
+// /fonts/. Bundled into the binary so the UI needs no external font CDN —
+// important since it usually runs offline on the CDJ link-local network.
+//
+//go:embed web/fonts/*.woff2 web/fonts/OFL.txt
+var webFontsFS embed.FS
+
+// RegisterWebUI adds GET / serving the bundled single-page HTML UI on
+// the given mux, plus /fonts/ for the embedded fonts. Off by default; opt in
+// via the --web CLI flag in main. The page polls the existing JSON endpoints
+// (/api/players, /api/tracks, /api/settings) every second for live updates.
+func RegisterWebUI(mux *http.ServeMux) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(webIndexHTML)
+	})
+
+	serveAssets(mux, "css", "text/css; charset=utf-8")
+	serveAssets(mux, "js", "text/javascript; charset=utf-8")
+
+	// Now-playing overlay for streaming (OBS browser source, transparent bg).
+	mux.HandleFunc("/overlay", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(webOverlayHTML)
+	})
+
+	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/manifest+json")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.Write(webManifestJSON)
+	})
+	for _, name := range []string{"icon-192.png", "icon-512.png"} {
+		name := name
+		mux.HandleFunc("/"+name, func(w http.ResponseWriter, r *http.Request) {
+			data, _ := webIconsFS.ReadFile("web/" + name)
+			w.Header().Set("Content-Type", "image/png")
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+			w.Write(data)
+		})
+	}
+
+	// App icon (vinyl + the null ∅), used as the browser-tab favicon.
+	mux.HandleFunc("/favicon.svg", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/svg+xml")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.Write(webFaviconSVG)
+	})
+
+	fonts, _ := fs.Sub(webFontsFS, "web/fonts")
+	mux.HandleFunc("/fonts/", func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/fonts/")
+		data, err := fs.ReadFile(fonts, name) // invalid/.. paths fail fs.ValidPath
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		ct := "font/woff2"
+		if strings.HasSuffix(name, ".txt") {
+			ct = "text/plain; charset=utf-8"
+		}
+		w.Header().Set("Content-Type", ct)
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Write(data)
+	})
+}
+
+// serveAssets serves the files of web/<dir> at /<dir>/, each with an ETag of
+// its contents: a browser revalidates them (no-cache) and gets 304 until the
+// daemon has a new version of the file.
+func serveAssets(mux *http.ServeMux, dir, contentType string) {
+	type asset struct {
+		data []byte
+		etag string
+	}
+	assets := map[string]asset{}
+	entries, _ := fs.ReadDir(webAssetsFS, "web/"+dir)
+	for _, e := range entries {
+		data, _ := webAssetsFS.ReadFile("web/" + dir + "/" + e.Name())
+		sum := sha256.Sum256(data)
+		assets[e.Name()] = asset{data, `"` + hex.EncodeToString(sum[:8]) + `"`}
+	}
+	mux.HandleFunc("/"+dir+"/", func(w http.ResponseWriter, r *http.Request) {
+		a, ok := assets[strings.TrimPrefix(r.URL.Path, "/"+dir+"/")]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("ETag", a.etag)
+		if r.Header.Get("If-None-Match") == a.etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Write(a.data)
+	})
+}

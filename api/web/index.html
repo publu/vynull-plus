@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0c0c0f">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<title>Vynull · DJ LINK</title>
+<link rel="stylesheet" href="/css/base.css">
+<link rel="stylesheet" href="/css/players.css">
+<link rel="stylesheet" href="/css/library.css">
+<link rel="stylesheet" href="/css/settings.css">
+<link rel="stylesheet" href="/css/playlists.css">
+<link rel="stylesheet" href="/css/tags.css">
+<link rel="stylesheet" href="/css/drawer.css">
+<link rel="stylesheet" href="/css/statusbar.css">
+<link rel="stylesheet" href="/css/diag.css">
+<link rel="stylesheet" href="/css/toast.css">
+<link rel="stylesheet" href="/css/mobile.css">
+<script>
+  // Apply the saved theme before first paint to avoid a flash of the default.
+  try { document.documentElement.dataset.theme = localStorage.getItem('theme') || 'dark'; } catch (e) {}
+</script>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="wordmark">
+    <span class="dot"></span>
+    VYNULL
+    <sub>DJ LINK MONITOR · v1</sub>
+  </div>
+  <div></div>
+  <div class="status-cluster">
+    <span class="lcd-chip"><span class="led green pulse" id="link-led"></span><span>LINK</span></span>
+    <span class="lcd-chip"><span id="peer-count">0</span>&nbsp;PEER</span>
+    <button type="button" id="unlink-btn" class="lcd-chip unlink-btn" title="Disconnect all CDJs (they'll reconnect on their own a few seconds later)">UNLINK</button>
+    <span class="lcd-chip"><span id="uptime">00:00:00</span></span>
+    <select id="theme-select" class="theme-select" title="UI theme">
+      <option value="dark">TERMINAL</option>
+      <option value="slate">SLATE</option>
+      <option value="light">LIGHT</option>
+    </select>
+  </div>
+</div>
+
+<nav class="tabs">
+  <div class="tab active" data-tab="players"><span class="tick">◢</span>PLAYERS</div>
+  <div class="tab" data-tab="library"><span class="tick">◢</span>LIBRARY</div>
+  <div class="tab" data-tab="tags"><span class="tick">◢</span>TAGS</div>
+  <div class="tab" data-tab="settings"><span class="tick">◢</span>SETTINGS</div>
+  <div class="tab" data-tab="diag"><span class="tick">◢</span>DIAG</div>
+</nav>
+
+<main>
+  <section id="players" class="panel active">
+    <div id="mixer-strip"></div>
+    <div id="players-content">
+      <div class="empty-state">AWAITING DEVICE LINK</div>
+    </div>
+  </section>
+
+  <section id="library" class="panel">
+    <div class="lib-layout">
+      <div class="lib-sidebar-backdrop" id="lib-sidebar-backdrop"></div>
+      <aside class="lib-sidebar" id="lib-sidebar">
+        <div class="lib-sidebar-head">
+          <button type="button" class="lib-src active" data-source="collection">
+            <span class="icon">▦</span><span class="name">COLLECTION</span><span class="count" id="lib-coll-count"></span>
+          </button>
+        </div>
+        <div class="lib-sidebar-section">PLAYLISTS</div>
+        <div class="lib-sidebar-tree" id="lib-sidebar-tree">
+          <div class="pl-empty">— LOADING —</div>
+        </div>
+        <div class="lib-sidebar-section" id="lib-history-head" style="display:none">HISTORY</div>
+        <div class="lib-sidebar-tree" id="lib-sidebar-history"></div>
+        <div class="lib-sidebar-section" id="lib-hcb-head" style="display:none">HOT CUE BANKS</div>
+        <div class="lib-sidebar-tree" id="lib-sidebar-hcb"></div>
+        <div class="lib-sidebar-foot">
+          <button type="button" id="pl-new-pl"     title="New playlist">+ PL</button>
+          <button type="button" id="pl-new-smart"  title="New smart playlist">+ SMART</button>
+          <button type="button" id="pl-new-folder" title="New folder">+ FLD</button>
+        </div>
+      </aside>
+      <div class="lib-main">
+        <div class="lib-toolbar">
+          <button type="button" id="lib-src-toggle" class="lib-src-toggle" title="Playlists & source">
+            <span class="icon">☰</span><span class="name" id="lib-src-toggle-name">COLLECTION</span>
+          </button>
+          <span class="lib-source-name" id="lib-source-name">COLLECTION</span>
+          <div class="input-wrap">
+            <input type="text" id="lib-search" class="input" placeholder="FILTER TRACKS…" autocomplete="off">
+            <button type="button" id="lib-search-clear" class="input-clear" title="Clear filter">×</button>
+          </div>
+          <button type="button" id="lib-columns-btn" class="lib-tool-btn" title="Configure visible columns">
+            <span class="icon">≡</span>COLUMNS
+          </button>
+          <div id="lib-playlist-actions" class="lib-playlist-actions"></div>
+          <div class="lib-stats" id="lib-stats"></div>
+        </div>
+        <div class="lib-filterbar" id="lib-filterbar"></div>
+        <div id="library-content"><div class="empty-state">LOADING</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tags" class="panel">
+    <div id="tags-tab-content">
+      <div class="empty-state">LOADING</div>
+    </div>
+  </section>
+
+  <section id="settings" class="panel">
+    <div class="settings-note">
+      EDIT TO PUSH LIVE · CDJ CHANGES FLOW BACK AUTOMATICALLY · LAST-WRITE-WINS
+    </div>
+    <div class="settings-layout">
+      <aside id="settings-nav" class="settings-nav"></aside>
+      <div id="settings-content" class="settings-content">
+        <div class="empty-state">LOADING</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="diag" class="panel">
+    <div class="diag-grid">
+      <div class="diag-card">
+        <div class="diag-card-head">RUNTIME</div>
+        <dl class="diag-list" id="diag-runtime"><dt>—</dt><dd>loading</dd></dl>
+      </div>
+      <div class="diag-card">
+        <div class="diag-card-head">LIBRARY</div>
+        <dl class="diag-list" id="diag-library"><dt>—</dt><dd>loading</dd></dl>
+      </div>
+      <div class="diag-card">
+        <div class="diag-card-head">ANALYSIS</div>
+        <dl class="diag-list" id="diag-analysis"><dt>—</dt><dd>loading</dd></dl>
+      </div>
+    </div>
+    <div class="diag-logs">
+      <div class="diag-card-head">RECENT LOG <span class="export-hint" style="display:inline; font-weight:normal">— newest at bottom · auto-refreshes every 2s</span></div>
+      <div class="diag-log-filters">
+        <input type="text" id="diag-log-filter" class="input" placeholder="filter (substring, case-insensitive)" autocomplete="off" spellcheck="false">
+        <label class="diag-log-toggle"><input type="checkbox" id="diag-log-errors"> errors only</label>
+        <span class="diag-log-sources" id="diag-log-sources"></span>
+      </div>
+      <pre id="diag-log" class="diag-log">loading…</pre>
+    </div>
+  </section>
+</main>
+
+<!-- Bulk-action bar (lives outside <main> so position:fixed escapes the
+     panel-rise animation's transform, which would otherwise create a
+     containing block and pin the bar to the panel's bottom). -->
+<div class="bulk-bar" id="bulk-bar"></div>
+
+<!-- Track detail drawer (right-side slide-in) -->
+<div class="detail-backdrop" id="detail-backdrop"></div>
+<aside class="detail-drawer" id="detail-drawer" aria-hidden="true">
+  <div class="detail-resize" id="detail-resize" title="Drag to resize"></div>
+  <div class="detail-head">
+    <div class="label">TRACK DETAIL<span class="id-chip" id="detail-id"></span></div>
+    <button class="detail-close" id="detail-close" title="Close (Esc)">×</button>
+  </div>
+  <div class="detail-body" id="detail-body"></div>
+</aside>
+
+<div class="statusbar">
+  <span class="item" id="server-status" style="display:none"><span class="led"></span><span class="server-status-text"></span></span>
+  <span class="spacer"></span>
+  <span class="item" id="wave-color-btn" title="Web waveform colour — click to cycle. AUTO follows the CDJ 'waveform color' DEVSETTING." style="cursor:pointer; user-select:none"><span class="led green"></span><span id="wave-color-label">WAVE: AUTO</span></span>
+  <span class="item" id="vocal-det-btn" title="Vocal-detection markers (🎤) on the phrase strip — click to cycle off / low / med / high sensitivity. Our own lightweight detector; a hint, not exact." style="cursor:pointer; user-select:none"><span class="led green"></span><span id="vocal-det-label">VOCAL: MED</span></span>
+  <span class="item" id="link-status" title="Devices on the Pro DJ Link network"><span class="led"></span><span id="link-status-text">NO LINK</span></span>
+  <a class="item app-version sb-version" target="_blank" rel="noopener"></a>
+</div>
+
+<div id="toast"></div>
+
+<script src="/js/boot.js"></script>
+<script src="/js/diag.js"></script>
+<script src="/js/core.js"></script>
+<script src="/js/columns.js"></script>
+<script src="/js/waveform-thumbs.js"></script>
+<script src="/js/keys.js"></script>
+<script src="/js/waveforms.js"></script>
+<script src="/js/cue-overlays.js"></script>
+<script src="/js/audio.js"></script>
+<script src="/js/players.js"></script>
+<script src="/js/library.js"></script>
+<script src="/js/settings.js"></script>
+<script src="/js/drawer.js"></script>
+<script src="/js/tags-playlists.js"></script>
+<script src="/js/filter.js"></script>
+<script src="/js/export.js"></script>
+<script src="/js/smart-playlists.js"></script>
+<script src="/js/poll.js"></script>
+</body>
+</html>

@@ -1,0 +1,901 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package dbserver
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/vynulldev/vynull/analysis"
+	"github.com/vynulldev/vynull/internal/dlog"
+	"github.com/vynulldev/vynull/library"
+	"github.com/vynulldev/vynull/pdb"
+	"github.com/vynulldev/vynull/proto"
+)
+
+const (
+	discoveryPort = 12523
+)
+
+// RootMenuEntry is one slot in the CDJ's top-level LINK menu. Filled
+// by main.go from the api.MenuStore so users can configure
+// visibility + order from the web UI without touching the dbserver.
+type RootMenuEntry struct {
+	ID       uint32
+	Label    string
+	ItemType uint32
+}
+
+// DefaultRootMenu is the built-in root-menu category set served when no
+// MenuSource is wired. Exported so the conformance server can reuse the exact
+// default while still supplying its own second (detail) column.
+func DefaultRootMenu() []RootMenuEntry {
+	// The 20 categories, order, IDs, and item types rekordbox 7.2.19 serves as
+	// its default LINK root menu (verified against the link-spec conformance
+	// oracle). The item type is a per-category constant, not a formula. A wired
+	// MenuSource (the web UI's configurable menu) overrides this.
+	return []RootMenuEntry{
+		{ID: 4, Label: "TRACK", ItemType: 0x83},
+		{ID: 12, Label: "KEY", ItemType: 0x8b},
+		{ID: 6, Label: "BPM", ItemType: 0x85},
+		{ID: 1, Label: "GENRE", ItemType: 0x80},
+		{ID: 2, Label: "ARTIST", ItemType: 0x81},
+		{ID: 3, Label: "ALBUM", ItemType: 0x82},
+		{ID: 26, Label: "MATCHING", ItemType: 0xaa},
+		{ID: 18, Label: "SEARCH", ItemType: 0x91},
+		{ID: 5, Label: "PLAYLIST", ItemType: 0x84},
+		{ID: 22, Label: "HISTORY", ItemType: 0x95},
+		{ID: 20, Label: "BITRATE", ItemType: 0x93},
+		{ID: 15, Label: "COLOR", ItemType: 0x8e},
+		{ID: 21, Label: "FILE NAME", ItemType: 0x94},
+		{ID: 23, Label: "HOT CUE BANK", ItemType: 0x98},
+		{ID: 10, Label: "LABEL", ItemType: 0x89},
+		{ID: 11, Label: "ORIGINAL ARTIST", ItemType: 0x8a},
+		{ID: 7, Label: "RATING", ItemType: 0x86},
+		{ID: 9, Label: "REMIXER", ItemType: 0x88},
+		{ID: 19, Label: "TIME", ItemType: 0x92},
+		{ID: 8, Label: "YEAR", ItemType: 0x87},
+	}
+}
+
+// MenuSource lets handleRootMenu pull the user-configured root menu.
+// When the Server has no MenuSource wired, handleRootMenu falls back
+// to a hardcoded default set so existing installs keep working.
+//
+// TrackDetail returns the key of the field the CDJ should render in
+// the second column of every track list (e.g. "bpm", "artist", "key").
+// Empty string means "use the historical default" (BPM) so the
+// fallback path doesn't have to mind it.
+type MenuSource interface {
+	RootMenu() []RootMenuEntry
+	TrackDetail() string
+}
+
+// MyTagSource gives the dbserver the MyTag catalog and assignments for the
+// TRACK FILTER's MyTag condition: the columns (categories) in order, a
+// column's tags in order, and a track's tag IDs. Tags that no track carries
+// are left out of a column's list, as rekordbox does.
+type MyTagSource interface {
+	MyTagColumns() []MyTagEntry
+	MyTagsIn(columnID uint32) []MyTagEntry
+	TrackMyTags(trackID uint32) []uint32
+}
+
+// MyTagEntry is one MyTag column or tag.
+type MyTagEntry struct {
+	ID   uint32
+	Name string
+}
+
+// PlaylistEntry is the minimal shape the dbserver needs to render the
+// CDJ's PLAYLIST menu. Implemented by api.PlaylistStore (and any future
+// playlist source) so the dbserver doesn't depend on the api package.
+type PlaylistEntry struct {
+	ID       uint32
+	Name     string
+	IsFolder bool
+	Seq      uint32 // rekordbox display sequence, served in menu-row arg 9 (0 if unknown)
+}
+
+// PlaylistSource exposes user-defined playlists to the dbserver. The
+// shape is intentionally tree-walk friendly: Children gives one level
+// at a time (matching how the CDJ navigates 0x1105), Tracks returns the
+// ordered track IDs for a leaf playlist.
+type PlaylistSource interface {
+	Children(parentID uint32) []PlaylistEntry
+	Tracks(playlistID uint32) []uint32
+	// HistoryFolderID returns the playlist-store ID of the
+	// auto-managed "History" folder (0 if it hasn't been created
+	// yet — typically before any track has crossed the play-count
+	// threshold), which doesn't count as a user playlist (see
+	// storeHasUserPlaylists).
+	HistoryFolderID() uint32
+}
+
+// SmartPlaylistSource is optionally implemented by a PlaylistSource whose
+// playlists can be smart (rule-based): rekordbox serves a smart playlist's
+// rows slightly differently.
+type SmartPlaylistSource interface {
+	IsSmart(playlistID uint32) bool
+}
+
+// Server implements the Pro DJ Link database server protocol.
+type Server struct {
+	// MyTags serves the TRACK FILTER's MyTag lists and matching (nil: none).
+	MyTags MyTagSource
+	// filters holds every player's TRACK FILTER settings across sessions.
+	filters trackFilters
+	// history is the Link history the decks keep (linkhistory.go).
+	history linkHistory
+	// recent holds the list each request context last queried, which
+	// rekordbox keeps for the whole server (recentlists.go).
+	recent recentLists
+	// rows holds the library's prebuilt track rows (trackrows.go).
+	rows rowCache
+	// Clock names a new Link history after its day (optional; nil uses
+	// time.Now). The conformance server pins it.
+	Clock        func() time.Time
+	Library      *library.Library
+	DeviceNumber uint8
+	ExportRoot   string
+	Analysis     *analysis.Store
+	Folders      *pdb.FolderLookup
+	Playlists    PlaylistSource // optional; if nil, PLAYLIST menu falls back to filesystem folders
+	Menu         MenuSource     // optional; if nil, root menu falls back to a built-in default list
+	Cues         *CueStore
+	ReplayDir    string // if set, serve raw response packets from this directory
+	// Transcode tells the decks that FLAC, WAV and AIFF tracks are MP3s, as
+	// the NFS server serves them with --transcode.
+	Transcode bool
+	// ExportPlaylists is a served USB export's playlist tree, from its PDB
+	// (nil: none). The PLAYLIST menu serves it while the playlist store has
+	// no playlists of its own.
+	ExportPlaylists []*pdb.FolderNode
+
+	// OnPeerTeardown, if set, is invoked when a CDJ sends us a 0x0100
+	// Teardown message — main.go wires this to PeerTracker.RemoveByIP so
+	// we stop including the peer in keep-alive counts, settings
+	// notifications, etc. Without this we'd wait 5s for the keep-alive
+	// timeout to drop them.
+	OnPeerTeardown func(net.IP)
+
+	// LinkedFn, if set, gates new incoming TCP connections. When it
+	// returns false, both the discovery port (12523) and the dynamic
+	// query port immediately close any new connection — so a CDJ
+	// can't re-browse our library after the user clicks UNLINK even
+	// if it tries to reconnect.
+	LinkedFn func() bool
+
+	// BindHost, if set, restricts the listeners to that host (e.g. "127.0.0.1"
+	// for the conformance server). Empty binds all interfaces, as a real
+	// rekordbox source must.
+	BindHost string
+	// Ready, if non-nil, is closed once the listeners are bound and QueryPort
+	// is valid. Used by the conformance server to learn the dynamic port.
+	Ready chan struct{}
+
+	discoveryLn net.Listener
+	dynamicLn   net.Listener
+	dynamicPort uint16 // OS-assigned ephemeral port
+
+	// activeConns tracks live dynamic-port client connections so we can
+	// send a 0x0100 Teardown message to each one on shutdown.
+	activeConns   map[net.Conn]struct{}
+	activeConnsMu sync.Mutex
+}
+
+// ApplyAnalysis writes an analysis back to its track (see applyAnalysis).
+// main makes it the analysis store's OnAnalyzed, so every analysis the queue
+// finishes is written back once, whoever asked for it.
+func (s *Server) ApplyAnalysis(trackID uint32, r *analysis.Result) {
+	applyAnalysis(s.Library, trackID, r)
+}
+
+// Start begins listening on both the discovery port (12523) and a
+// random dynamic query port.
+func (s *Server) Start(ctx context.Context) error {
+	var err error
+
+	// BindHost is empty for normal serving (all interfaces, ":port"); the
+	// conformance server sets it to "127.0.0.1" to stay on loopback.
+	s.discoveryLn, err = net.Listen("tcp4", fmt.Sprintf("%s:%d", s.BindHost, discoveryPort))
+	if err != nil {
+		return fmt.Errorf("bind discovery port %d: %w", discoveryPort, err)
+	}
+
+	// Let the OS pick a random ephemeral port.
+	s.dynamicLn, err = net.Listen("tcp4", s.BindHost+":0")
+	if err != nil {
+		s.discoveryLn.Close()
+		return fmt.Errorf("bind dynamic port: %w", err)
+	}
+	s.dynamicPort = uint16(s.dynamicLn.Addr().(*net.TCPAddr).Port)
+
+	dlog.Infof("dbserver listening on ports %d (discovery) and %d (queries)", discoveryPort, s.dynamicPort)
+
+	// Signal readiness (the conformance server waits on this before reading
+	// QueryPort). nil in normal serving.
+	if s.Ready != nil {
+		close(s.Ready)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		s.acceptDiscovery(ctx)
+	}()
+
+	go func() {
+		defer wg.Done()
+		s.acceptDynamic(ctx)
+	}()
+
+	<-ctx.Done()
+	// Politely tell connected CDJs we're going away (this exact packet is
+	// sent to each active dbserver session on shutdown).
+	s.sendTeardownToActiveConns()
+	s.discoveryLn.Close()
+	s.dynamicLn.Close()
+	wg.Wait()
+	return nil
+}
+
+// sendTeardownToActiveConns sends a 0x0100 (Teardown) dbserver message
+// with TxID = DBSetupTxID to each active dynamic-port client connection
+// before we close the listener. CDJs interpret this as a clean session
+// end (vs raw TCP RST which can leave the CDJ in a confused state on
+// some firmware versions).
+func (s *Server) sendTeardownToActiveConns() {
+	s.activeConnsMu.Lock()
+	conns := make([]net.Conn, 0, len(s.activeConns))
+	for c := range s.activeConns {
+		conns = append(conns, c)
+	}
+	s.activeConnsMu.Unlock()
+
+	if len(conns) == 0 {
+		return
+	}
+
+	teardown := proto.MarshalDBMessage(&proto.DBMessage{
+		TxID: proto.DBSetupTxID,
+		Type: 0x0100,
+	})
+	dlog.Infof("dbserver: sending teardown (0x0100) to %d active session(s)", len(conns))
+	for _, c := range conns {
+		c.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+		if _, err := c.Write(teardown); err != nil {
+			dlog.Infof("dbserver: teardown write to %s: %v", c.RemoteAddr(), err)
+		}
+	}
+}
+
+func (s *Server) trackConn(conn net.Conn) {
+	s.activeConnsMu.Lock()
+	defer s.activeConnsMu.Unlock()
+	if s.activeConns == nil {
+		s.activeConns = make(map[net.Conn]struct{})
+	}
+	s.activeConns[conn] = struct{}{}
+}
+
+func (s *Server) untrackConn(conn net.Conn) {
+	s.activeConnsMu.Lock()
+	defer s.activeConnsMu.Unlock()
+	delete(s.activeConns, conn)
+}
+
+// QueryPort returns the OS-assigned dynamic query port (valid once Ready has
+// been signalled / Start has bound the listeners).
+func (s *Server) QueryPort() uint16 { return s.dynamicPort }
+
+// ActiveSessions returns the count of live dynamic-port client connections.
+// Used by the periodic resource logger to spot session accumulation.
+func (s *Server) ActiveSessions() int {
+	s.activeConnsMu.Lock()
+	defer s.activeConnsMu.Unlock()
+	return len(s.activeConns)
+}
+
+// Unlink sends a 0x0100 teardown to every active dbserver session and then
+// closes the underlying TCP connections. CDJs interpret this as "rekordbox
+// went away" and drop their cached link state. The keep-alive broadcaster
+// keeps running, so CDJs can re-link on their own a few seconds later
+// (typical Pioneer "unlink" UX). Returns the number of sessions closed.
+func (s *Server) Unlink() int {
+	s.sendTeardownToActiveConns()
+
+	s.activeConnsMu.Lock()
+	conns := make([]net.Conn, 0, len(s.activeConns))
+	for c := range s.activeConns {
+		conns = append(conns, c)
+	}
+	s.activeConnsMu.Unlock()
+
+	// Give the teardown bytes a moment to flush before we yank the socket.
+	if len(conns) > 0 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	for _, c := range conns {
+		// Close triggers the handler goroutine's read to return io.EOF,
+		// which untrackConn drops from the map naturally.
+		c.Close()
+	}
+	if len(conns) > 0 {
+		dlog.Infof("dbserver: unlink closed %d session(s)", len(conns))
+	}
+	return len(conns)
+}
+
+// acceptDiscovery handles connections on port 12523.
+func (s *Server) acceptDiscovery(ctx context.Context) {
+	for {
+		conn, err := s.discoveryLn.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				dlog.Infof("dbserver discovery accept: %v", err)
+				return
+			}
+		}
+		if s.LinkedFn != nil && !s.LinkedFn() {
+			dlog.Infof("dbserver discovery: rejecting %s (unlinked)", conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+		go s.handleDiscovery(conn)
+	}
+}
+
+func (s *Server) handleDiscovery(conn net.Conn) {
+	defer conn.Close()
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	// Read the CDJ's discovery query. Format: 4-byte length prefix + body.
+	// E.g.: 00 00 00 0f "RemoteDBServer" 00 (4 + 15 = 19 bytes)
+	// TCP may deliver in chunks, so use ReadFull for the length, then body.
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+		dlog.Infof("dbserver discovery read length: %v", err)
+		return
+	}
+	bodyLen := int(binary.BigEndian.Uint32(lenBuf[:]))
+	if bodyLen > 256 || bodyLen < 0 {
+		dlog.Infof("dbserver discovery: invalid length %d", bodyLen)
+		return
+	}
+	buf := make([]byte, bodyLen)
+	n := 0
+	if bodyLen > 0 {
+		var err error
+		n, err = io.ReadFull(conn, buf)
+		if err != nil {
+			dlog.Infof("dbserver discovery read body: %v", err)
+			return
+		}
+	}
+
+	dlog.Tracef("dbserver discovery from %s (%d bytes):\n%s",
+		conn.RemoteAddr(), n, hex.Dump(buf[:n]))
+
+	// Respond with dynamic port number for the dbserver.
+	resp := make([]byte, 2)
+	binary.BigEndian.PutUint16(resp, s.dynamicPort)
+	dlog.Debugf("dbserver discovery: sent port %d to %s", s.dynamicPort, conn.RemoteAddr())
+	if _, err := conn.Write(resp); err != nil {
+		dlog.Infof("dbserver discovery write: %v", err)
+	}
+}
+
+// acceptDynamic handles connections on the dynamic port (1051).
+func (s *Server) acceptDynamic(ctx context.Context) {
+	for {
+		conn, err := s.dynamicLn.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				dlog.Infof("dbserver dynamic accept: %v", err)
+				return
+			}
+		}
+		if s.LinkedFn != nil && !s.LinkedFn() {
+			dlog.Infof("dbserver dynamic: rejecting %s (unlinked)", conn.RemoteAddr())
+			conn.Close()
+			continue
+		}
+		go s.handleSession(ctx, conn)
+	}
+}
+
+// handleSession processes a full dbserver session on the dynamic port.
+func (s *Server) handleSession(ctx context.Context, conn net.Conn) {
+	s.trackConn(conn)
+	defer s.untrackConn(conn)
+	defer conn.Close()
+	// A panic while serving one client (a malformed request reaching a bug
+	// in a decoder or handler) must end that session, not the daemon:
+	// unrecovered, a goroutine panic exits the whole process.
+	defer func() {
+		if r := recover(); r != nil {
+			dlog.Infof("dbserver: session %s ended by panic: %v\n%s", conn.RemoteAddr(), r, debug.Stack())
+		}
+	}()
+	dlog.Infof("dbserver session from %s", conn.RemoteAddr())
+
+	// Enable TCP keepalive to prevent idle timeout.
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(10 * time.Second)
+	}
+
+	// Handshake: CDJ sends 5 bytes, we echo them back.
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	clientHandshake := make([]byte, 5)
+	if _, err := io.ReadFull(conn, clientHandshake); err != nil {
+		dlog.Infof("dbserver handshake read: %v", err)
+		return
+	}
+	if _, err := conn.Write(clientHandshake); err != nil {
+		dlog.Infof("dbserver handshake write: %v", err)
+		return
+	}
+	dlog.Tracef("dbserver handshake: echo %s", hex.EncodeToString(clientHandshake))
+	dlog.Infof("dbserver handshake complete with %s", conn.RemoteAddr())
+
+	conn.SetReadDeadline(time.Time{}) // clear deadline
+
+	handler := &Handler{
+		lib:          s.Library,
+		deviceNumber: s.DeviceNumber,
+		exportRoot:   s.ExportRoot,
+		analysis:     s.Analysis,
+		folders:      s.Folders,
+		playlists:    s.Playlists,
+		history:      &s.history,
+		recent:       &s.recent,
+		rowCache:     &s.rows,
+		clock:        s.Clock,
+		menu:         s.Menu,
+		cues:         s.Cues,
+		filters:      &s.filters,
+		mytags:       s.MyTags,
+		transcode:    s.Transcode,
+		exportTree:   s.ExportPlaylists,
+	}
+
+	// Requests are read through a buffer: readMessage reads each field on
+	// its own, which unbuffered was a read from the socket per field.
+	rc := bufConn{Conn: conn, r: bufio.NewReader(conn)}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		msg, err := readMessage(rc)
+		if err != nil {
+			switch {
+			case err == io.EOF || err == io.ErrUnexpectedEOF:
+				dlog.Infof("dbserver: client %s disconnected", conn.RemoteAddr())
+			case errors.Is(err, errBadFrame):
+				// As rekordbox does: answer a malformed request with a
+				// teardown, then drop the session.
+				dlog.Infof("dbserver: %v from %s, sending teardown", err, conn.RemoteAddr())
+				conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+				conn.Write(proto.MarshalDBMessage(&proto.DBMessage{TxID: proto.DBSetupTxID, Type: 0x0100}))
+			default:
+				dlog.Infof("dbserver read: %v", err)
+			}
+			return
+		}
+
+		// 0x0100 = Teardown. Peer is politely closing — notify so the
+		// device layer can drop them from the active peer list immediately
+		// (otherwise we wait up to 5s for keep-alive timeout).
+		if msg.Type == 0x0100 && s.OnPeerTeardown != nil {
+			if tcpAddr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+				dlog.Infof("dbserver: 0x0100 teardown from %s — removing peer", tcpAddr.IP)
+				s.OnPeerTeardown(tcpAddr.IP)
+			}
+		}
+
+		responses := handler.Handle(msg)
+		// Coalesce all response messages into a single TCP write,
+		// which sends Header+Items+Footer in one segment.
+		var combined []byte
+		for _, resp := range responses {
+			data := proto.MarshalDBMessage(resp)
+
+			// Replay mode: if we have a recorded response
+			// for this response type, use those exact bytes instead.
+			if s.ReplayDir != "" {
+				if replacement := s.findReplay(resp.Type, len(data), msg); replacement != nil {
+					// Fix up the txid to match the current request.
+					binary.BigEndian.PutUint32(replacement[6:10], msg.TxID)
+					dlog.Tracef("dbserver REPLAY type=0x%04x txid=%08x (%d bytes from recording)",
+						resp.Type, msg.TxID, len(replacement))
+					data = replacement
+				}
+			}
+			// Per-response send logging removed; menu queries fan out into
+			// many sub-messages and each line allocated a formatted string.
+			// Replay path keeps its log so unintended fallback is visible.
+			//
+			// At trace level, dump the exact bytes we put on the wire for each
+			// response message so a hung deck can be traced to the last response
+			// it accepted before its dbserver client wedged.
+			if dlog.Enabled(dlog.Trace) {
+				dlog.Tracef("dbserver SEND type=0x%04x txid=%08x (%d bytes):\n%s",
+					resp.Type, resp.TxID, len(data), hex.Dump(data))
+			}
+
+			combined = append(combined, data...)
+		}
+		if len(combined) > 0 {
+			if _, err := conn.Write(combined); err != nil {
+				dlog.Infof("dbserver write: %v", err)
+				return
+			}
+		}
+	}
+}
+
+// bufConn is a connection whose reads go through a buffer; deadlines and
+// writes go to the connection itself.
+type bufConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (c bufConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// errBadFrame marks a request that violates the dbserver framing (bad magic,
+// too many arguments, an unknown field tag, an oversized field). rekordbox
+// answers such a request with a teardown (0x0100) and drops the session, and
+// so do we; other read errors (EOF, timeouts) just close it.
+var errBadFrame = errors.New("malformed dbserver frame")
+
+// Limits on what a request may declare. A real request carries at most 12
+// arguments (the tag list is 12 bytes) and small blobs and strings; anything
+// larger is refused without allocating what the sender claims.
+const (
+	maxDBArgs        = 12
+	maxTagListLen    = 64
+	maxDBFieldLen    = 1 << 20 // bytes, for one blob or string argument
+	dbArgReadTimeout = 5 * time.Second
+)
+
+// readMessage reads a single dbserver message from the connection.
+func readMessage(conn net.Conn) (*proto.DBMessage, error) {
+	// Messages can be framed in two ways:
+	// 1. [0x11] [magic 4] [0x11] [header+body] — standard framing
+	// 2. [4-byte BE length] [0x11] [magic 4] [0x11] [header+body] — length-prefixed
+	//
+	// We detect which by reading the first byte.
+	var first [1]byte
+	if _, err := io.ReadFull(conn, first[:]); err != nil {
+		return nil, err
+	}
+
+	// Handle length-prefixed framing: [4-byte BE length] [payload]
+	// The payload contains: [0x11] [magic 4] [0x11] [header+args]
+	if first[0] == 0x00 {
+		var lenRest [3]byte
+		if _, err := io.ReadFull(conn, lenRest[:]); err != nil {
+			return nil, fmt.Errorf("read length prefix: %w", err)
+		}
+		msgLen := int(binary.BigEndian.Uint32(append([]byte{first[0]}, lenRest[:]...)))
+		if msgLen <= 0 || msgLen > 65536 {
+			return nil, fmt.Errorf("invalid message length: %d", msgLen)
+		}
+		payload := make([]byte, msgLen)
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return nil, fmt.Errorf("read length-prefixed payload (%d bytes): %w", msgLen, err)
+		}
+		// Parse the payload — find the header after skipping frame bytes.
+		// Payload format: [0x11?] [magic 4] [0x11] [header...]
+		// or just: [header...] without magic
+		// Try to find and skip past the magic.
+		start := 0
+		for start < len(payload) && payload[start] == 0x11 {
+			start++
+		}
+		// Check if magic follows.
+		if start+4 <= len(payload) && payload[start] == proto.DBMagic[0] &&
+			payload[start+1] == proto.DBMagic[1] &&
+			payload[start+2] == proto.DBMagic[2] &&
+			payload[start+3] == proto.DBMagic[3] {
+			start += 4
+			// Skip separator 0x11.
+			if start < len(payload) && payload[start] == 0x11 {
+				start++
+			}
+		}
+		if start >= len(payload) {
+			return nil, fmt.Errorf("length-prefixed payload too short after stripping frame")
+		}
+		return proto.ParseDBMessage(payload[start:])
+	}
+
+	var magic [4]byte
+	if first[0] == proto.DBMagic[0] {
+		magic[0] = first[0]
+		if _, err := io.ReadFull(conn, magic[1:]); err != nil {
+			return nil, err
+		}
+	} else if first[0] == 0x11 {
+		if _, err := io.ReadFull(conn, magic[:]); err != nil {
+			return nil, err
+		}
+	} else {
+		// Unknown framing — dump raw bytes for debugging.
+		peek := make([]byte, 64)
+		peek[0] = first[0]
+		n, _ := conn.Read(peek[1:])
+		dlog.Infof("dbserver unknown framing, raw bytes:\n%s", hex.Dump(peek[:n+1]))
+		return nil, fmt.Errorf("unexpected byte 0x%02x", first[0])
+	}
+
+	if magic != proto.DBMagic {
+		return nil, fmt.Errorf("%w: invalid magic %x", errBadFrame, magic)
+	}
+
+	// Read fields in wire order:
+	// After magic, read: txid(NumberField4), type(NumberField2),
+	// argcount(NumberField1), tags(BinaryField)
+
+	// Transaction ID: [0x11] [4 bytes]
+	txidField := make([]byte, 5)
+	if _, err := io.ReadFull(conn, txidField); err != nil {
+		return nil, fmt.Errorf("read txid field: %w", err)
+	}
+	txid := binary.BigEndian.Uint32(txidField[1:5])
+
+	// Message type: [0x10] [2 bytes]
+	typeField := make([]byte, 3)
+	if _, err := io.ReadFull(conn, typeField); err != nil {
+		return nil, fmt.Errorf("read type field: %w", err)
+	}
+	msgType := binary.BigEndian.Uint16(typeField[1:3])
+
+	// Argument count: [0x0f] [1 byte]
+	countField := make([]byte, 2)
+	if _, err := io.ReadFull(conn, countField); err != nil {
+		return nil, fmt.Errorf("read argcount field: %w", err)
+	}
+	argCount := int(countField[1])
+	if argCount > maxDBArgs {
+		return nil, fmt.Errorf("%w: %d arguments (max %d)", errBadFrame, argCount, maxDBArgs)
+	}
+
+	// Tags: [0x14] [4-byte length] [12 bytes]
+	tagsHeader := make([]byte, 5)
+	if _, err := io.ReadFull(conn, tagsHeader); err != nil {
+		return nil, fmt.Errorf("read tags header: %w", err)
+	}
+	tagsLen := int(binary.BigEndian.Uint32(tagsHeader[1:5]))
+	if tagsLen > maxTagListLen {
+		return nil, fmt.Errorf("%w: tag list of %d bytes", errBadFrame, tagsLen)
+	}
+	tags := make([]byte, tagsLen)
+	if tagsLen > 0 {
+		if _, err := io.ReadFull(conn, tags); err != nil {
+			return nil, fmt.Errorf("read tags data: %w", err)
+		}
+	}
+
+	// Per-message recv logging removed from the hot path — menu browsing
+	// produces dozens of these per second and hex.EncodeToString(tags)
+	// allocates every time. Re-enable here if you're debugging a new
+	// request type.
+
+	// Read arguments as typed fields.
+	// Each argument is: [type_tag 1] [data...]
+	// NumberField: 0x0f XX | 0x10 XX XX | 0x11 XX XX XX XX
+	// BinaryField: 0x14 [4-byte len] [data]
+	// StringField: 0x26 [4-byte char count] [utf16 data]
+	msg := &proto.DBMessage{
+		TxID: txid,
+		Type: msgType,
+	}
+
+	// Some read queries (waveform preview, etc.) advertise a trailing binary
+	// arg (tag 0x03) that is never sent — we must NOT try to read it or we'd
+	// block. But some commands DO transmit it, and skipping it then leaves
+	// the blob in the TCP stream and desyncs framing on the next read
+	// ("unexpected byte 0x14", session dropped until the deck reconnects):
+	//   0x2705 = cue save (binary cue blob)
+	//   0x2805 = tagged analysis-section read — sends a ~150-byte binary spec
+	//            blob (e.g. "PVB2"/"EXT"). This was the cause of the deck
+	//            dropping the dbserver link mid-session.
+	//   0x3207 = TRACK FILTER condition — the condition blob (on, kind,
+	//            count, values). Skipping it dropped the session the moment a
+	//            filter was ticked, and the deck unticked it.
+	actualArgCount := argCount
+	sendsTrailingBinary := msgType == 0x2705 || msgType == 0x2805 || msgType == 0x3207
+	if !sendsTrailingBinary {
+		// A tag list shorter than the argument count (malformed) has no tag
+		// for the missing positions; treat those as sent, so the read below
+		// waits for them like rekordbox does instead of indexing past the end.
+		for i := argCount - 1; i >= 0; i-- {
+			if i < len(tags) && tags[i] == 0x03 {
+				actualArgCount = i
+			} else {
+				break
+			}
+		}
+	}
+
+	conn.SetReadDeadline(time.Now().Add(dbArgReadTimeout))
+	for i := 0; i < actualArgCount; i++ {
+		var tagByte [1]byte
+		if _, err := io.ReadFull(conn, tagByte[:]); err != nil {
+			return nil, fmt.Errorf("arg %d/%d tag: %w", i, actualArgCount, err)
+		}
+		arg := proto.DBArg{}
+		switch tagByte[0] {
+		case 0x0f, 0x04: // 1-byte number
+			var v [1]byte
+			if _, err := io.ReadFull(conn, v[:]); err != nil {
+				return nil, fmt.Errorf("arg %d (int8): %w", i, err)
+			}
+			arg.Tag = proto.ArgInt8
+			arg.Int8 = v[0]
+		case 0x10, 0x05: // 2-byte number
+			var v [2]byte
+			if _, err := io.ReadFull(conn, v[:]); err != nil {
+				return nil, fmt.Errorf("arg %d (int16): %w", i, err)
+			}
+			arg.Tag = proto.ArgInt16
+			arg.Int16 = binary.BigEndian.Uint16(v[:])
+		case 0x11, 0x06: // 4-byte number
+			var v [4]byte
+			if _, err := io.ReadFull(conn, v[:]); err != nil {
+				return nil, fmt.Errorf("arg %d (int32): %w", i, err)
+			}
+			arg.Tag = proto.ArgInt32
+			arg.Int32 = binary.BigEndian.Uint32(v[:])
+		case 0x14, 0x03: // binary (0x14 = standard, 0x03 = CDJ alternate)
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+				return nil, fmt.Errorf("arg %d (binary len): %w", i, err)
+			}
+			length := int(binary.BigEndian.Uint32(lenBuf[:]))
+			if length > maxDBFieldLen {
+				return nil, oversizedField(conn, i, "binary", int64(length))
+			}
+			data := make([]byte, length)
+			if length > 0 {
+				if _, err := io.ReadFull(conn, data); err != nil {
+					return nil, fmt.Errorf("arg %d (binary data): %w", i, err)
+				}
+			}
+			arg.Tag = proto.ArgBinary
+			arg.Bytes = data
+		case 0x26, 0x02: // string
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+				return nil, fmt.Errorf("arg %d (string len): %w", i, err)
+			}
+			charCount := int(binary.BigEndian.Uint32(lenBuf[:]))
+			if charCount*2 > maxDBFieldLen {
+				return nil, oversizedField(conn, i, "string", int64(charCount)*2)
+			}
+			data := make([]byte, charCount*2)
+			if charCount > 0 {
+				if _, err := io.ReadFull(conn, data); err != nil {
+					return nil, fmt.Errorf("arg %d (string data): %w", i, err)
+				}
+			}
+			arg.Tag = proto.ArgString
+			arg.Str = string(data) // raw UTF-16 bytes
+		default:
+			return nil, fmt.Errorf("%w: arg %d has unknown field tag 0x%02x", errBadFrame, i, tagByte[0])
+		}
+		msg.Args = append(msg.Args, arg)
+	}
+
+	conn.SetReadDeadline(time.Time{}) // clear deadline
+	return msg, nil
+}
+
+// oversizedField handles a blob or string argument declaring more than
+// maxDBFieldLen bytes. Rather than allocate what the sender claims (up to
+// 4 GiB), it reads and discards the declared body, like rekordbox waiting for
+// it, until the argument read deadline ends the session; if the sender really
+// does deliver it all in time, the request is refused as a bad frame.
+func oversizedField(conn net.Conn, i int, kind string, n int64) error {
+	if _, err := io.CopyN(io.Discard, conn, n); err != nil {
+		return fmt.Errorf("arg %d (%s): declared %d bytes: %w", i, kind, n, err)
+	}
+	return fmt.Errorf("%w: arg %d (%s) of %d bytes", errBadFrame, i, kind, n)
+}
+
+// findReplay looks for a recorded response file in the replay directory.
+// Files are named like "PWV4_651_7273.bin", "PWAV_645_948.bin", etc.
+// Matches by response type and content tag (e.g., PWV4 inside 0x4f02).
+func (s *Server) findReplay(respType uint16, ourSize int, req *proto.DBMessage) []byte {
+	if s.ReplayDir == "" {
+		return nil
+	}
+
+	// Determine which tag to look for based on response type and request context.
+	var prefix string
+	switch respType {
+	case 0x4f02: // ext analysis response — match by ANLZ tag
+		// Check the request's tag fourcc
+		if req != nil && req.Type == 0x2c04 && len(req.Args) >= 3 {
+			v := req.Args[2].Int()
+			b := [4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}
+			tag := string([]byte{b[3], b[2], b[1], b[0]})
+			switch tag {
+			case "PWV4":
+				prefix = "PWV4"
+			case "PWV5":
+				prefix = "PWV5"
+			case "PQT2":
+				prefix = "PQT2"
+			case "PVB2":
+				prefix = "NOT_FOUND" // real RB returns not-found for PVB2
+			default:
+				prefix = "NOT_FOUND"
+			}
+		}
+	case 0x4402:
+		prefix = "PWAV"
+	case 0x4602:
+		prefix = "PQTZ"
+	case 0x4502:
+		prefix = "PSSI_0x4502"
+	case 0x4e02:
+		prefix = "NXS2_CUE"
+	default:
+		return nil
+	}
+
+	if prefix == "" {
+		return nil
+	}
+
+	// Find first matching file.
+	entries, err := os.ReadDir(s.ReplayDir)
+	if err != nil {
+		return nil
+	}
+
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if strings.HasPrefix(name, prefix) && filepath.Ext(name) == ".bin" {
+			data, err := os.ReadFile(filepath.Join(s.ReplayDir, name))
+			if err != nil {
+				continue
+			}
+			return data
+		}
+	}
+
+	return nil
+}

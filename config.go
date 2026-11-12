@@ -1,0 +1,336 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package main
+
+import (
+	"flag"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/vynulldev/vynull/internal/buildinfo"
+	"github.com/vynulldev/vynull/proto"
+)
+
+// stringSlice collects a repeatable string flag (e.g. --browse-root a --browse-root b).
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ", ") }
+func (s *stringSlice) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
+type Config struct {
+	Interface      string
+	MusicDir       string
+	BrowseRoots    []string // extra roots the web "add files/folders" browser may access
+	DeviceNumber   uint8
+	DeviceName     string
+	DeviceType     proto.DeviceType
+	CDJMode        bool // true in --mode cdj (needs the privileged RPC port 111)
+	MediaSlot      uint8
+	GenerateDir    string  // if set, generate USB structure instead of serving
+	GenerateCopy   bool    // copy files instead of symlinking
+	LazyAnalysis   bool    // if true, analyze tracks on-demand instead of upfront
+	Transcode      bool    // if true, transcode FLAC/WAV/AIFF to MP3 for NFS serving
+	DataDir        string  // directory for cached analysis and settings data
+	ReplayDir      string  // if set, replay recorded response packets from this directory
+	PWV4Override   string  // path to raw PWV4 bytes to inject for every track at serve time
+	PWV5Override   string  // path to raw PWV5 bytes to inject for every track at serve time
+	SettingsFile   string  // path to JSON settings config (default: <data-dir>/settings.json)
+	ImportSettings string  // path to a PIONEER directory containing rekordbox .DAT files to import
+	ExportPlaylist string  // with --generate, exports only this playlist (matched by name) — USB tree contains just that playlist
+	Web            bool    // if true, serve an HTML UI at the API listen address
+	MPRIS          bool    // publish now-playing on the D-Bus session bus (default true; no-op without a bus)
+	TUI            bool    // if true (default), show the interactive terminal monitor; false runs headless
+	Listen         string  // API + web listen address (default: 127.0.0.1:9443; use 0.0.0.0:9443 to expose to LAN)
+	LogLevel       string  // log verbosity: error|warn|info|debug|trace (default: info)
+	LogFile        string  // if set, append logs to this file instead of the default destination
+	HistoryFile    string  // if set, write the track-history file here instead of the default
+	HistoryFormat  string  // track-history format: text|csv|json (default: text)
+	BPMMin         float64 // --bpm-range lower bound (0 = unset: use the default 80-170 dance window)
+	BPMMax         float64 // --bpm-range upper bound
+	GridOffsetMs   float64 // --grid-offset (ms); GridOffsetSet reports whether it was given
+	GridOffsetSet  bool
+}
+
+// parseBPMRange parses a "MIN-MAX" tempo range (e.g. "160-185") into its
+// bounds. Both must be positive and MAX must exceed MIN.
+func parseBPMRange(s string) (lo, hi float64, err error) {
+	parts := strings.SplitN(strings.TrimSpace(s), "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("expected MIN-MAX, e.g. 160-185 (got %q)", s)
+	}
+	if lo, err = strconv.ParseFloat(strings.TrimSpace(parts[0]), 64); err != nil {
+		return 0, 0, fmt.Errorf("bad lower bound %q", strings.TrimSpace(parts[0]))
+	}
+	if hi, err = strconv.ParseFloat(strings.TrimSpace(parts[1]), 64); err != nil {
+		return 0, 0, fmt.Errorf("bad upper bound %q", strings.TrimSpace(parts[1]))
+	}
+	if lo <= 0 || hi <= 0 {
+		return 0, 0, fmt.Errorf("bounds must be positive (got %g-%g)", lo, hi)
+	}
+	if hi <= lo {
+		return 0, 0, fmt.Errorf("upper bound %g must exceed lower bound %g", hi, lo)
+	}
+	return lo, hi, nil
+}
+
+func parseFlags() Config {
+	var cfg Config
+	var deviceNum int
+	var mode string
+
+	flag.StringVar(&cfg.Interface, "interface", "", "network interface to use (required for serving)")
+	flag.StringVar(&cfg.MusicDir, "music-dir", "", "path to music directory to scan at startup (optional: omit for library mode and add tracks via the API; required with --generate)")
+	flag.Var((*stringSlice)(&cfg.BrowseRoots), "browse-root", "extra root directory the web UI's 'add files/folders' browser may reach (repeatable). Added to the defaults: --music-dir, your home, /media, /mnt, /run/media")
+	flag.IntVar(&deviceNum, "device-number", 0, "device number (default: 17 for rekordbox, 3 for cdj)")
+	flag.StringVar(&cfg.DeviceName, "device-name", "", "device name broadcast to CDJs")
+	flag.StringVar(&mode, "mode", "rekordbox", "emulation mode: rekordbox or cdj")
+	flag.StringVar(&cfg.GenerateDir, "generate", "", "generate Rekordbox USB structure at this path (no server)")
+	flag.BoolVar(&cfg.GenerateCopy, "copy-files", false, "copy files when generating (default: symlink)")
+	flag.BoolVar(&cfg.LazyAnalysis, "lazy-analysis", false, "analyze tracks on-demand when CDJs request them (fast startup)")
+	flag.BoolVar(&cfg.Transcode, "transcode", false, "transcode FLAC/WAV/AIFF to MP3 for CDJ playback")
+	flag.StringVar(&cfg.DataDir, "data-dir", "", "directory for cached analysis/settings (default: ~/.vynull)")
+	flag.StringVar(&cfg.ReplayDir, "replay", "", "replay recorded response packets from this directory")
+	flag.StringVar(&cfg.PWV4Override, "pwv4-override", "", "inject raw PWV4 bytes from this file for every track at serve time (for CDJ rendering experiments)")
+	flag.StringVar(&cfg.PWV5Override, "pwv5-override", "", "inject raw PWV5 bytes from this file for every track at serve time (for CDJ rendering experiments)")
+	flag.StringVar(&cfg.SettingsFile, "settings", "", "path to JSON CDJ settings config (default: <data-dir>/settings.json; created with defaults if missing; legacy settings.yaml is migrated automatically)")
+	flag.StringVar(&cfg.ImportSettings, "import-settings", "", "import rekordbox MYSETTING/MYSETTING2/DJMMYSETTING/DEVSETTING .DAT files from this directory into the JSON config and exit (point at a /PIONEER directory on a rekordbox USB)")
+	flag.StringVar(&cfg.ExportPlaylist, "export-playlist", "", "with --generate, export only this playlist (matched by name, case-insensitive). The resulting USB contains just the playlist's tracks and a single-playlist tree.")
+	flag.BoolVar(&cfg.MPRIS, "mpris", true, "publish the audible deck's now-playing as an MPRIS player on the D-Bus session bus (desktop media controls, playerctl, KDE Connect). Silently disabled when no session bus exists")
+	flag.BoolVar(&cfg.Web, "web", false, "serve an HTML UI alongside the existing JSON API (off by default)")
+	flag.BoolVar(&cfg.TUI, "tui", true, "show the interactive terminal monitor UI (on by default). Use --tui=false to run headless: no altscreen, logs stay on stdout — for systemd/nohup or non-TTY environments")
+	flag.StringVar(&cfg.Listen, "listen", "127.0.0.1:9443", "API + web listen address. Use 0.0.0.0:9443 to expose on all interfaces (e.g. for access from another device on the LAN)")
+	flag.StringVar(&cfg.LogLevel, "log-level", "info", "log verbosity: error, warn, info, debug, or trace. Trace adds per-packet NFS / dbserver hex dumps; debug adds mount and portmap detail. Default info keeps the operationally-useful lines visible without per-packet spam.")
+	flag.StringVar(&cfg.LogFile, "log-file", "", "append logs to this file (default: an auto temp file while the TUI is shown, or stdout when headless with --tui=false)")
+	flag.StringVar(&cfg.HistoryFile, "history-file", "", "append the played-track history to this file as tracks finish; one rolling file across sessions (default: <data-dir>/history.<ext>)")
+	flag.StringVar(&cfg.HistoryFormat, "history-format", "text", "track-history format: text, csv, or json (json is one object per line / JSONL)")
+	var bpmRange string
+	flag.StringVar(&bpmRange, "bpm-range", "", "constrain BPM detection to a tempo range, e.g. 160-185, so fast genres (drum & bass) stop analyzing at half/third tempo. Applies to all analysis and re-analyzes affected tracks. Default: the usual 80-170 dance window")
+
+	var gridOffset string
+	flag.StringVar(&gridOffset, "grid-offset", "", "shift every detected beat grid by this many ms (negative = earlier). Overrides the web Analysis Setting for this session. Default: 0 (match rekordbox)")
+
+	showVersion := flag.Bool("version", false, "print the version and exit")
+
+	flag.Usage = printGroupedUsage
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("vynull", buildinfo.Get())
+		os.Exit(0)
+	}
+
+	if gridOffset != "" {
+		v, err := strconv.ParseFloat(strings.TrimSpace(gridOffset), 64)
+		if err != nil || math.IsNaN(v) || math.Abs(v) > 200 {
+			fmt.Fprintf(os.Stderr, "error: --grid-offset: want milliseconds between -200 and 200, got %q\n", gridOffset)
+			os.Exit(1)
+		}
+		cfg.GridOffsetMs, cfg.GridOffsetSet = v, true
+	}
+
+	if bpmRange != "" {
+		lo, hi, err := parseBPMRange(bpmRange)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: --bpm-range: %v\n", err)
+			os.Exit(1)
+		}
+		cfg.BPMMin, cfg.BPMMax = lo, hi
+	}
+
+	// Default data dir.
+	if cfg.DataDir == "" {
+		home, _ := os.UserHomeDir()
+		cfg.DataDir = home + "/.vynull"
+	}
+
+	switch mode {
+	case "rekordbox":
+		cfg.DeviceType = proto.DeviceRekordbox
+		cfg.MediaSlot = proto.SlotRekordbox
+		if deviceNum == 0 {
+			deviceNum = 17
+		}
+		if cfg.DeviceName == "" {
+			// Displayed name on the CDJ. Rekordbox sends "rekordbox"
+			// here; the deck appears to grant "rekordbox source" treatment
+			// from the device number / slot type / link handshake rather
+			// than this string, so showing our own name should be cosmetic.
+			// If a deck ever refuses the link or settings after this, revert
+			// to "rekordbox" (or pass --device-name rekordbox).
+			cfg.DeviceName = "Vynull"
+		}
+	case "cdj":
+		cfg.DeviceType = proto.DeviceCDJ
+		cfg.MediaSlot = proto.SlotUSB
+		cfg.CDJMode = true
+		if deviceNum == 0 {
+			deviceNum = 3
+		}
+		if cfg.DeviceName == "" {
+			cfg.DeviceName = "Virtual CDJ"
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "error: --mode must be 'rekordbox' or 'cdj'\n")
+		os.Exit(1)
+	}
+
+	cfg.DeviceNumber = uint8(deviceNum)
+
+	// --import-settings mode needs no other flags.
+	if cfg.ImportSettings != "" {
+		cfg.DeviceNumber = uint8(deviceNum)
+		return cfg
+	}
+
+	var errs []string
+	if cfg.GenerateDir == "" && cfg.Interface == "" {
+		errs = append(errs, "--interface is required (unless using --generate)")
+	}
+	if cfg.MusicDir == "" && cfg.GenerateDir != "" {
+		errs = append(errs, "--music-dir is required for --generate")
+	}
+	if deviceNum < 1 || deviceNum > 127 {
+		errs = append(errs, "--device-number must be between 1 and 127")
+	}
+	if cfg.HistoryFormat != "text" && cfg.HistoryFormat != "csv" && cfg.HistoryFormat != "json" {
+		errs = append(errs, "--history-format must be text, csv, or json")
+	}
+
+	if len(errs) > 0 {
+		for _, e := range errs {
+			fmt.Fprintf(os.Stderr, "error: %s\n", e)
+		}
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	return cfg
+}
+
+// ---------- grouped --help output ----------
+
+// flagGroup names a section in the --help output and the flags that
+// belong to it. Listing here is the source of truth for display order;
+// flag definitions live above in parseFlags and stay in alphabetical
+// order so the Go flag package can register and parse them.
+type flagGroup struct {
+	title string
+	flags []string
+}
+
+var flagGroups = []flagGroup{
+	{"Network identity (required to serve)", []string{
+		"interface", "mode", "device-number", "device-name",
+	}},
+	{"Library + analysis", []string{
+		"music-dir", "data-dir", "lazy-analysis", "transcode", "bpm-range", "grid-offset",
+	}},
+	{"CDJ settings", []string{
+		"settings", "import-settings",
+	}},
+	{"HTTP API + user interfaces", []string{
+		"listen", "web", "tui",
+	}},
+	{"Logging", []string{
+		"log-level", "log-file",
+	}},
+	{"Track history", []string{
+		"history-file", "history-format",
+	}},
+	{"USB export (alternative to serving)", []string{
+		"generate", "copy-files", "export-playlist",
+	}},
+	{"Waveform calibration / experiments", []string{
+		"pwv4-override", "pwv5-override", "replay",
+	}},
+}
+
+// printGroupedUsage replaces flag.PrintDefaults' alphabetical dump with
+// flags organised into logical groups (see flagGroups). Mirrors the
+// "  -flag value\n        description" indentation Go's stdlib uses so
+// existing tooling (godoc, completions) still recognises the layout.
+func printGroupedUsage() {
+	w := flag.CommandLine.Output()
+	fmt.Fprintf(w, "Usage: %s [flags]           start the server\n", os.Args[0])
+	fmt.Fprintf(w, "       %s <command> [args]  run a client command against a running server\n\n", os.Args[0])
+	printCommandsUsage(w)
+
+	seen := map[string]bool{}
+	for _, g := range flagGroups {
+		fmt.Fprintf(w, "%s:\n", g.title)
+		for _, name := range g.flags {
+			f := flag.Lookup(name)
+			if f == nil {
+				continue
+			}
+			seen[name] = true
+			printFlag(w, f)
+		}
+		fmt.Fprintln(w)
+	}
+
+	// Any flags not assigned to a group go in an "Other" section so we
+	// never silently drop one (e.g. a newly-added flag whose author forgot
+	// to add it to flagGroups).
+	var other []string
+	flag.VisitAll(func(f *flag.Flag) {
+		if !seen[f.Name] {
+			other = append(other, f.Name)
+		}
+	})
+	if len(other) > 0 {
+		fmt.Fprintln(w, "Other:")
+		for _, name := range other {
+			printFlag(w, flag.Lookup(name))
+		}
+	}
+}
+
+func printFlag(w io.Writer, f *flag.Flag) {
+	name, usage := flag.UnquoteUsage(f)
+	header := "  -" + f.Name
+	if name != "" {
+		header += " " + name
+	}
+	// Skip the auto-default for "false" (bool default) and "0" (which usually
+	// means "unset, derive later" in our flags) — the description carries
+	// the real meaning in those cases.
+	if f.DefValue != "" && f.DefValue != "false" && f.DefValue != "0" {
+		header += "  (default " + f.DefValue + ")"
+	}
+	fmt.Fprintln(w, header)
+	// Wrap usage at ~78 columns, indented 8 spaces.
+	for _, line := range wrap(usage, 70) {
+		fmt.Fprintln(w, "        "+line)
+	}
+}
+
+// wrap splits s into lines of at most maxWidth, breaking on whitespace.
+func wrap(s string, maxWidth int) []string {
+	var out []string
+	for _, paragraph := range strings.Split(s, "\n") {
+		words := strings.Fields(paragraph)
+		if len(words) == 0 {
+			out = append(out, "")
+			continue
+		}
+		line := words[0]
+		for _, w := range words[1:] {
+			if len(line)+1+len(w) > maxWidth {
+				out = append(out, line)
+				line = w
+			} else {
+				line += " " + w
+			}
+		}
+		out = append(out, line)
+	}
+	return out
+}

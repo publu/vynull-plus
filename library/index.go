@@ -1,0 +1,607 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package library
+
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
+	"os"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	"github.com/vynulldev/vynull/internal/dlog"
+	"github.com/vynulldev/vynull/internal/saver"
+)
+
+// HashID generates a stable rekordbox-style 32-bit ID from a type and name.
+// rekordbox uses large IDs (e.g., 0x0addf33c) from its master database.
+// We generate them as a hash so the same entity always gets the same ID.
+func HashID(entityType, name string) uint32 {
+	h := sha256.Sum256([]byte(entityType + ":" + name))
+	id := binary.BigEndian.Uint32(h[:4])
+	if id == 0 {
+		id = 1 // avoid zero ID
+	}
+	return id
+}
+
+// Library holds all tracks and provides lookup indices.
+//
+// The track slice and the per-artist, album and genre slices are never
+// modified in place once handed out: removing a track builds new slices. So a
+// slice returned by Tracks or TracksBy* stays a consistent snapshot while the
+// library changes. Callers must not modify those slices themselves.
+type Library struct {
+	Artwork *ArtworkCache
+
+	mu       sync.RWMutex
+	tracks   []*Track // all tracks, in the order they were added
+	nextID   uint32   // next sequential track ID
+	byID     map[uint32]*Track
+	order    map[uint32]uint64   // track ID -> when it was added; index lists keep this order
+	seq      uint64              // next order value
+	byPath   map[string][]*Track // the tracks with each file path (usually one)
+	byArtist map[string][]*Track
+	byAlbum  map[string][]*Track
+	byGenre  map[string][]*Track
+
+	artists []string
+	albums  []string
+	genres  []string
+
+	// catIDs maps a category kind ("genre"/"artist"/"album"/"key"/"label") and
+	// value name to the rekordbox lookup-table row ID, populated from a
+	// master.db import. Lets the dbserver serve rekordbox's real category IDs
+	// instead of hashed names. Empty for non-rekordbox-sourced libraries.
+	catIDs map[string]map[string]uint32
+
+	// songTags holds the library track IDs that carry at least one MyTag
+	// (djmdSongMyTag) assignment, populated from a master.db import. The
+	// dbserver sets argument 7's song-tag bit on these tracks' menu rows.
+	songTags map[uint32]struct{}
+
+	// hotCueBanks holds rekordbox Hot Cue Banks from a master.db import,
+	// persisted beside the track list (hotcuebank.go).
+	hotCueBanks *hotCueBankSet
+
+	dbPath string // if set, persist track list to this JSON file
+
+	// saver writes the track list in the background once dbPath is set
+	// (writer.go).
+	saver *saver.Saver
+
+	// rev is a monotonic revision counter bumped whenever track data
+	// changes. Clients poll it (cheaply) and only refetch the full track
+	// list when it moves, instead of diffing the whole library every tick.
+	// Bumped by Save() (every persisted mutation) and by Touch() (in-place
+	// edits that persist elsewhere, e.g. tag/colour/rating stores).
+	rev atomic.Uint64
+}
+
+// Rev returns the current library revision. It changes whenever track data
+// changes; callers compare it to skip redundant full-list fetches.
+func (l *Library) Rev() uint64 { return l.rev.Load() }
+
+// Touch bumps the revision without writing to disk — for callers that
+// mutate track data in place (or in a side store) without a Save().
+func (l *Library) Touch() { l.rev.Add(1) }
+
+// RegisterCategoryID records the rekordbox lookup-table ID for a category
+// value, where kind is one of "genre"/"artist"/"album"/"key"/"label". Empty
+// names and zero IDs are ignored. Populated during a master.db import so the
+// dbserver can serve rekordbox's real category IDs instead of hashed names.
+func (l *Library) RegisterCategoryID(kind, name string, id uint32) {
+	if name == "" || id == 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.catIDs == nil {
+		l.catIDs = make(map[string]map[string]uint32)
+	}
+	m := l.catIDs[kind]
+	if m == nil {
+		m = make(map[string]uint32)
+		l.catIDs[kind] = m
+	}
+	m[name] = id
+}
+
+// CategoryID returns the rekordbox lookup-table ID recorded for a category
+// value, or 0 if none was imported (e.g. a non-rekordbox-sourced library).
+func (l *Library) CategoryID(kind, name string) uint32 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.catIDs == nil {
+		return 0
+	}
+	if m := l.catIDs[kind]; m != nil {
+		return m[name]
+	}
+	return 0
+}
+
+// MarkSongTag records that the given track carries at least one MyTag
+// assignment. Idempotent; populated during a master.db import.
+func (l *Library) MarkSongTag(id uint32) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.songTags == nil {
+		l.songTags = make(map[uint32]struct{})
+	}
+	l.songTags[id] = struct{}{}
+}
+
+// HasSongTag reports whether the track carries at least one MyTag assignment.
+func (l *Library) HasSongTag(id uint32) bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	_, ok := l.songTags[id]
+	return ok
+}
+
+// AddRelated records a symmetric related-track relationship (both a->b and
+// b->a), deduping, on the tracks' Related lists so it persists with the
+// library. Populated during a master.db import for the MATCHING browse; the
+// caller saves (an import does so once at the end).
+func (l *Library) AddRelated(a, b uint32) {
+	if a == 0 || b == 0 || a == b {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	ta, tb := l.byID[a], l.byID[b]
+	if ta == nil || tb == nil {
+		return
+	}
+	add := func(from *Track, to uint32) {
+		for _, x := range from.Related {
+			if x == to {
+				return
+			}
+		}
+		from.Related = append(from.Related, to)
+	}
+	add(ta, b)
+	add(tb, a)
+}
+
+// Related returns the track IDs related to the given track (either direction),
+// or nil if none were imported.
+func (l *Library) Related(id uint32) []uint32 {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	t := l.byID[id]
+	if t == nil || len(t.Related) == 0 {
+		return nil
+	}
+	return append([]uint32(nil), t.Related...)
+}
+
+// New creates an empty Library for adding tracks dynamically.
+func New() *Library {
+	return NewLibrary(nil, NewArtworkCache())
+}
+
+// NewLibrary builds a Library with indices from the given tracks.
+func NewLibrary(tracks []*Track, artwork *ArtworkCache) *Library {
+	lib := &Library{
+		Artwork:  artwork,
+		tracks:   tracks,
+		nextID:   1,
+		byID:     make(map[uint32]*Track, len(tracks)),
+		order:    make(map[uint32]uint64, len(tracks)),
+		byPath:   make(map[string][]*Track, len(tracks)),
+		byArtist: make(map[string][]*Track),
+		byAlbum:  make(map[string][]*Track),
+		byGenre:  make(map[string][]*Track),
+	}
+
+	artistSet := make(map[string]bool)
+	albumSet := make(map[string]bool)
+	genreSet := make(map[string]bool)
+
+	for _, t := range tracks {
+		lib.byID[t.ID] = t
+		lib.order[t.ID] = lib.seq
+		lib.seq++
+		lib.byPath[t.FilePath] = append(lib.byPath[t.FilePath], t)
+		if t.ID >= lib.nextID {
+			lib.nextID = t.ID + 1
+		}
+
+		if t.Artist != "" {
+			key := strings.ToLower(t.Artist)
+			lib.byArtist[key] = append(lib.byArtist[key], t)
+			artistSet[t.Artist] = true
+		}
+		if t.Album != "" {
+			key := strings.ToLower(t.Album)
+			lib.byAlbum[key] = append(lib.byAlbum[key], t)
+			albumSet[t.Album] = true
+		}
+		if t.Genre != "" {
+			key := strings.ToLower(t.Genre)
+			lib.byGenre[key] = append(lib.byGenre[key], t)
+			genreSet[t.Genre] = true
+		}
+	}
+
+	lib.artists = sortedKeys(artistSet)
+	lib.albums = sortedKeys(albumSet)
+	lib.genres = sortedKeys(genreSet)
+
+	return lib
+}
+
+// Track returns a track by its ID.
+func (l *Library) Track(id uint32) *Track {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.byID[id]
+}
+
+// Tracks returns all tracks, in the order they were added. The slice is a
+// snapshot that later changes to the library don't disturb; don't modify it
+// (sort a copy instead).
+func (l *Library) Tracks() []*Track {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return slices.Clip(l.tracks)
+}
+
+// TrackCount returns the total number of tracks.
+func (l *Library) TrackCount() int {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return len(l.tracks)
+}
+
+// Artists returns all unique artist names, sorted.
+func (l *Library) Artists() []string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.artists
+}
+
+// Albums returns all unique album names, sorted.
+func (l *Library) Albums() []string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.albums
+}
+
+// Genres returns all unique genre names, sorted.
+func (l *Library) Genres() []string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.genres
+}
+
+// TracksByArtist returns tracks for the given artist (case-insensitive), as
+// a snapshot like Tracks.
+func (l *Library) TracksByArtist(artist string) []*Track {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return slices.Clip(l.byArtist[strings.ToLower(artist)])
+}
+
+// TracksByAlbum returns tracks for the given album (case-insensitive), as a
+// snapshot like Tracks.
+func (l *Library) TracksByAlbum(album string) []*Track {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return slices.Clip(l.byAlbum[strings.ToLower(album)])
+}
+
+// TracksByGenre returns tracks for the given genre (case-insensitive), as a
+// snapshot like Tracks.
+func (l *Library) TracksByGenre(genre string) []*Track {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return slices.Clip(l.byGenre[strings.ToLower(genre)])
+}
+
+// addTrackLocked indexes a track (assigning a sequential ID if unset) without
+// rebuilding the sorted name lists or persisting. Caller must hold l.mu.
+func (l *Library) addTrackLocked(t *Track) uint32 {
+	if t.ID == 0 {
+		t.ID = l.nextID
+		l.nextID++
+	}
+	// Skip duplicates.
+	if l.byID[t.ID] != nil {
+		return t.ID
+	}
+	// Keep nextID ahead of any externally-assigned IDs.
+	if t.ID >= l.nextID {
+		l.nextID = t.ID + 1
+	}
+
+	l.tracks = append(l.tracks, t)
+	l.byID[t.ID] = t
+	l.order[t.ID] = l.seq
+	l.seq++
+	l.indexLocked(l.byPath, t.FilePath, t)
+	l.indexNameLocked(l.byArtist, t.Artist, t)
+	l.indexNameLocked(l.byAlbum, t.Album, t)
+	l.indexNameLocked(l.byGenre, t.Genre, t)
+	return t.ID
+}
+
+// AddTrack adds a single track, rebuilds the sorted lists, and persists.
+// Returns the assigned ID. For adding many tracks at once (import), use
+// AddTrackBulk + FinalizeBulk to avoid rebuilding/saving on every track.
+func (l *Library) AddTrack(t *Track) uint32 {
+	l.mu.Lock()
+	id := l.addTrackLocked(t)
+	l.rebuildLists()
+	l.mu.Unlock()
+	l.Save()
+	return id
+}
+
+// AddTrackBulk adds a track to the in-memory indices WITHOUT rebuilding the
+// sorted lists or saving to disk. Intended for bulk imports — call
+// FinalizeBulk once after the batch. Returns the assigned ID. (Routing a
+// full import through AddTrack instead is O(n²): every track triggers a full
+// library.json rewrite + list rebuild.)
+func (l *Library) AddTrackBulk(t *Track) uint32 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.addTrackLocked(t)
+}
+
+// FinalizeBulk rebuilds the sorted name lists and persists the library —
+// call once after a batch of AddTrackBulk calls.
+func (l *Library) FinalizeBulk() {
+	l.mu.Lock()
+	l.rebuildLists()
+	l.mu.Unlock()
+	l.Save()
+}
+
+// RemoveTrack drops a track from the in-memory library and persists the
+// change. Does NOT touch the underlying audio file. Returns true if the
+// track existed.
+func (l *Library) RemoveTrack(id uint32) bool {
+	l.mu.Lock()
+	t := l.byID[id]
+	if t == nil {
+		l.mu.Unlock()
+		return false
+	}
+	// New slices, not in-place deletes: callers may hold the old ones.
+	l.tracks = slices.DeleteFunc(slices.Clone(l.tracks), func(tr *Track) bool { return tr == t })
+	l.unindexLocked(l.byPath, t.FilePath, t)
+	l.unindexNameLocked(l.byArtist, t.Artist, t)
+	l.unindexNameLocked(l.byAlbum, t.Album, t)
+	l.unindexNameLocked(l.byGenre, t.Genre, t)
+	delete(l.byID, id)
+	delete(l.order, id)
+	l.rebuildLists()
+	l.mu.Unlock()
+	l.Save()
+	return true
+}
+
+// SetDBPath sets the path for persisting the track list. If the file exists, loads it.
+func (l *Library) SetDBPath(path string) {
+	l.dbPath = path
+	if l.saver == nil {
+		l.saver = saver.New("library", saver.Interval, l.writeTracks)
+	}
+	l.loadFromDisk()
+	l.loadHotCueBanks()
+}
+
+// IncrementPlayCount bumps the play count for trackID by 1 and persists the
+// library. Called from PlayerMonitor when a CDJ has played a track for at
+// least half its duration — matches the rekordbox "scrobble" threshold so
+// brief previews don't inflate the count. Returns the new count, or 0 if
+// the track isn't in the library.
+func (l *Library) IncrementPlayCount(trackID uint32) int {
+	l.mu.Lock()
+	t := l.byID[trackID]
+	if t == nil {
+		l.mu.Unlock()
+		return 0
+	}
+	t.PlayCount++
+	count := t.PlayCount
+	l.mu.Unlock()
+	l.Save()
+	return count
+}
+
+// SetRating sets a track's star rating (0-5, higher clamped to 5) and saves
+// the library, which owns ratings. Reports whether the track exists.
+func (l *Library) SetRating(trackID uint32, rating uint8) bool {
+	return l.SetRatings(map[uint32]uint8{trackID: rating}) == 1
+}
+
+// SetRatings sets several tracks' ratings (clamped to 5) and saves once.
+// Returns how many tracks it changed.
+func (l *Library) SetRatings(ratings map[uint32]uint8) int {
+	n := 0
+	l.mu.Lock()
+	for id, r := range ratings {
+		if t := l.byID[id]; t != nil {
+			t.Rating = min(r, 5)
+			n++
+		}
+	}
+	l.mu.Unlock()
+	if n > 0 {
+		l.Save()
+	}
+	return n
+}
+
+// SetColor sets a track's colour (1-8, 0 for none) and saves the library,
+// which owns track colours. Reports whether the track exists.
+func (l *Library) SetColor(trackID uint32, colorID uint8) bool {
+	return l.SetColors([]ColorImport{{TrackID: trackID, ColorID: colorID}}) == 1
+}
+
+// SetColors sets several tracks' colours and saves once. Colours above 8
+// are ignored. Returns how many tracks it changed.
+func (l *Library) SetColors(colors []ColorImport) int {
+	n := 0
+	l.mu.Lock()
+	for _, c := range colors {
+		if t := l.byID[c.TrackID]; t != nil && c.ColorID <= 8 {
+			t.ColorID = c.ColorID
+			n++
+		}
+	}
+	l.mu.Unlock()
+	if n > 0 {
+		l.Save()
+	}
+	return n
+}
+
+// AdoptArtwork stores artwork found for a track outside the usual artwork
+// pass (analysis extracts it too) and links it to the track, but only when the
+// track has no artwork and hasn't been checked for any, the same rule the
+// artwork pass follows. The image gets an ordinary artwork ID: artwork and
+// track IDs are separate spaces, so storing it under the track's ID could
+// overwrite or impersonate another track's artwork.
+func (l *Library) AdoptArtwork(trackID uint32, mimeType string, data []byte) {
+	if l.Artwork == nil || len(data) == 0 {
+		return
+	}
+	l.mu.RLock()
+	t := l.byID[trackID]
+	wanted := t != nil && t.ArtID == 0 && !t.ArtChecked
+	l.mu.RUnlock()
+	if !wanted {
+		return
+	}
+	l.SetArtwork(trackID, l.Artwork.Add(mimeType, data))
+}
+
+// SetArtwork records an extracted artwork ID for a track and marks it checked,
+// under the library lock — so lazy artwork extraction (which runs on request
+// goroutines) doesn't race the Save() that marshals the track list. It then
+// saves the library, which moves the revision, so the rows the dbserver
+// prebuilds pick up the artwork. The saves are coalesced, so scrolling the
+// web UI's ART column doesn't rewrite library.json per row.
+func (l *Library) SetArtwork(trackID, artID uint32) {
+	l.mu.Lock()
+	t := l.byID[trackID]
+	if t != nil {
+		t.ArtChecked = true
+		if artID != 0 {
+			t.ArtID = artID
+		}
+	}
+	l.mu.Unlock()
+	if t != nil {
+		l.Save()
+	}
+}
+
+func (l *Library) loadFromDisk() {
+	if l.dbPath == "" {
+		return
+	}
+	data, err := os.ReadFile(l.dbPath)
+	if err != nil {
+		return // file doesn't exist yet
+	}
+	var tracks []*Track
+	if err := json.Unmarshal(data, &tracks); err != nil {
+		dlog.Errorf("library: parse %s: %v", l.dbPath, err)
+		return
+	}
+	// Bulk-load: build the indexes directly and rebuild the sorted lists once
+	// at the end. Do NOT route through AddTrack here — it calls Save() and
+	// rebuildLists() per track, which on a full load is O(n²) (each Save
+	// rewrites the whole growing library.json). That made startup take ~9s
+	// for 1977 tracks; this brings it down to tens of ms. The in-memory
+	// result is identical — we just skip the per-track disk churn.
+	l.mu.Lock()
+	for _, t := range tracks {
+		// Preserve each track's persisted ID. IDs MUST be stable across loads —
+		// other stores (cues, tags, the waveform-PNG disk cache) key off the
+		// track ID, so reassigning by load order would re-point them at the
+		// wrong tracks the moment any track is added or removed. addTrackLocked
+		// assigns a sequential ID only when one is missing (t.ID == 0), so old
+		// records without an ID still get one.
+		l.addTrackLocked(t)
+	}
+	l.rebuildLists()
+	l.mu.Unlock()
+	dlog.Infof("library: loaded %d tracks from %s", len(tracks), l.dbPath)
+}
+
+// rebuildLists regenerates the sorted artist/album/genre name lists from the maps.
+func (l *Library) rebuildLists() {
+	artistSet := make(map[string]bool)
+	for key := range l.byArtist {
+		if tracks := l.byArtist[key]; len(tracks) > 0 {
+			artistSet[tracks[0].Artist] = true
+		}
+	}
+	albumSet := make(map[string]bool)
+	for key := range l.byAlbum {
+		if tracks := l.byAlbum[key]; len(tracks) > 0 {
+			albumSet[tracks[0].Album] = true
+		}
+	}
+	genreSet := make(map[string]bool)
+	for key := range l.byGenre {
+		if tracks := l.byGenre[key]; len(tracks) > 0 {
+			genreSet[tracks[0].Genre] = true
+		}
+	}
+	l.artists = sortedKeys(artistSet)
+	l.albums = sortedKeys(albumSet)
+	l.genres = sortedKeys(genreSet)
+}
+
+// TrackByPath finds a track by its file path, or nil. If several tracks have
+// the path, it returns the one added first.
+func (l *Library) TrackByPath(path string) *Track {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if ts := l.byPath[path]; len(ts) > 0 {
+		return ts[0]
+	}
+	return nil
+}
+
+// RemapPaths rewrites every track whose FilePath starts with `from` so
+// the prefix is replaced with `to`. Returns the number of tracks
+// changed and a slice of (old, new) pairs so the caller can rename
+// path-keyed caches (analysis .gob files in particular).
+func (l *Library) RemapPaths(from, to string) (int, [][2]string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var changes [][2]string
+	for _, t := range l.tracks {
+		if strings.HasPrefix(t.FilePath, from) {
+			old := t.FilePath
+			l.unindexLocked(l.byPath, old, t)
+			t.FilePath = to + strings.TrimPrefix(t.FilePath, from)
+			l.indexLocked(l.byPath, t.FilePath, t)
+			changes = append(changes, [2]string{old, t.FilePath})
+		}
+	}
+	return len(changes), changes
+}
+
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}

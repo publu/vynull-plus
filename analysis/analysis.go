@@ -1,0 +1,867 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+package analysis
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/gob"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"sync"
+	"sync/atomic"
+
+	"github.com/vynulldev/vynull/internal/dlog"
+	"github.com/vynulldev/vynull/internal/fsutil"
+	"github.com/vynulldev/vynull/pdb"
+)
+
+// AnalysisRate is the fixed decode/analysis sample rate (Hz). Exported so the
+// prolink encoder package (and its golden tests) can reference the same rate
+// the DSP runs at.
+const AnalysisRate = 44100
+
+// cacheVersion is incremented when the analysis format changes.
+// Cached results with a different version are discarded and re-analyzed.
+// Bumped to 18 when the V1 PWV4 encoder was removed and V2 became the
+// only encoder — old V1-encoded caches (saved as 17) and the older
+// experimental V2 caches (saved as 2017 behind --pwv4-v2) both invalidate
+// here, so the next run re-analyzes once and converges on a single format.
+// Bumped to 26 for the beat-grid phase improvements (windowed clarity-weighted
+// phase, gated half-beat flip, codec-aware lossless latency): the values in a
+// v25 cache are still readable but its grids predate those fixes, so one
+// re-analysis pass upgrades every library instead of only newly-added tracks.
+// Bumped to 27 for integer-snap BPM verification: ~1/3 of a real library
+// detected a fraction off the true integer tempo (and gridded at the wrong
+// period), so v26 BPMs and grids must re-analyze.
+// Bumped to 28 for the PWV4 7-bit band clamp: cached colour previews may
+// carry >127 in d2-d5, which real rekordbox never emits and which restarts
+// an XDJ-AZ on load, so v27 waveforms must re-encode.
+// Bumped to 29 for the TempogramLatencyMs re-trim (30 -> 34ms): every grid
+// shifts +4ms, substantially raising sub-10ms agreement with rekordbox's
+// grids, so v28 grids re-analyze to pick up the corrected phase.
+// Bumped to 30 for the beat-grid timing work: results record GridDetected and
+// GridOffsetMs so a changed user grid offset can shift cached detected grids
+// in place; tracks that start at full level are detected from silence; the
+// latency is recalibrated per format with a gapless-aware MP3 delay; and grids
+// are placed on the kick's measured attack. Most detected grids move by a few
+// ms. Hand-edited grids ride across the bump via gridCarry, as before.
+// Bumped to 31: beat 1 moves off a silent first beat (SilentLeadIndex).
+const cacheVersion = 31
+
+// PWV4Override and PWV5Override, when non-nil, replace every track's color
+// preview / detail waveform at serve time. Set via the --pwv4-override /
+// --pwv5-override CLI flags for probing the CDJ's per-point
+// rendering formula by injecting synthetic byte patterns. Does NOT modify
+// the on-disk cache — overrides are applied as a copy via ApplyOverrides.
+var (
+	PWV4Override []byte
+	PWV5Override []byte
+)
+
+// ApplyOverrides returns r unchanged if no overrides are set, or a shallow
+// clone with WaveColorPreview / WaveDetail swapped for the override bytes.
+// Call at every consumer site (dbserver, api) so synthetic bytes flow to
+// CDJs and HTTP clients without polluting cached results.
+func ApplyOverrides(r *Result) *Result {
+	if r == nil || (PWV4Override == nil && PWV5Override == nil) {
+		return r
+	}
+	clone := *r
+	if PWV4Override != nil {
+		clone.WaveColorPreview = PWV4Override
+	}
+	if PWV5Override != nil {
+		clone.WaveDetail = PWV5Override
+	}
+	return &clone
+}
+
+// Result holds computed analysis data for a single track.
+type Result struct {
+	CacheVersion     int // must match cacheVersion or result is stale
+	BPM              float64
+	Duration         uint16    // seconds
+	KeyCamelot       string    // e.g., "8A", "11B"
+	KeyStandard      string    // e.g., "Am", "Eb"
+	Artwork          []byte    // JPEG artwork data
+	WavePreview      []byte    // raw mono preview (~900 bytes, for dbserver)
+	WavePreviewANLZ  []byte    // raw mono preview (~400 bytes, for ANLZ .DAT file)
+	WaveTinyANLZ     []byte    // raw tiny mono preview (100 bytes, for PWV2 in .DAT)
+	WaveColorPreview []byte    // raw color preview (~5400 bytes)
+	WaveDetail       []byte    // raw color detail waveform, PWV5 format (2 bytes/entry, ~150/sec)
+	WaveDetail3Band  []byte    // 3-band detail waveform, PWV7 format (3 bytes/entry: bass,mid,treble; ~150/sec)
+	WavePreview3Band []byte    // 3-band preview waveform, PWV6 format (1200 entries × 3 bytes)
+	Wave3BandColor   []byte    // 3-band colour metadata, PWVC section body (6 bytes) — imported only, not yet served
+	WaveDetailMono   []byte    // raw monochrome detail waveform (1 byte/entry, ~150/sec)
+	BeatGrid         []byte    // beat grid blob for 0x2204 response
+	BeatGridPQT2     []byte    // PQT2 beat grid blob for 0x2c04 response (complete ANLZ section)
+	Beats            []float64 // beat positions in ms (for ANLZ PQTZ generation)
+	DownbeatIndex    int       // index into Beats of the first downbeat
+	SongStructure    []byte    // PSSI phrase analysis blob for 0x2504 response
+	Phrases          []Phrase  // detected phrases (intro/up/down/chorus/outro) — used by API/web UI
+	GridEdited       bool      // user manually adjusted the beat grid — serve our blobs, not the on-disk ANLZ
+	GridDetected     bool      // the grid came from our own beat detection (not an imported ANLZ grid)
+	GridOffsetMs     float64   // the user grid offset (GridOffset) this detected grid was built/shifted with
+	Imported         bool      // parsed from rekordbox's ANLZ files at import, not produced by our analysis
+
+	// TempoMinBPM / TempoMaxBPM record the --bpm-range setting this result was
+	// analyzed under (0 = the default dance window). The cache treats a result
+	// as stale when they differ from the current setting, so changing the range
+	// re-analyzes affected tracks instead of serving BPMs from the old range.
+	TempoMinBPM float64
+	TempoMaxBPM float64
+}
+
+// CopyForEdit returns a copy of r whose beats and phrases can be edited without
+// changing r: a stored result is shared with whoever is reading it (a deck
+// being served its grid, another request), and they must see the old grid or
+// the new one, never one half-way through an edit. The blobs are shared too,
+// so an edit replaces them rather than writing into them. Store the copy with
+// Set.
+func (r *Result) CopyForEdit() *Result {
+	c := *r
+	c.Beats = slices.Clone(r.Beats)
+	c.Phrases = slices.Clone(r.Phrases)
+	return &c
+}
+
+// gridCarry is a user-edited beat grid rescued from a stale-version cache
+// entry, awaiting re-application after re-analysis (see loadFromDisk / Set).
+type gridCarry struct {
+	beats    []float64
+	bpm      float64
+	downbeat int
+}
+
+// Store holds analysis results keyed by track ID.
+// When cacheDir is set, results are persisted to disk using gob encoding,
+// keyed by a hash of the track's file path for stable cache identity.
+type Store struct {
+	mu       sync.RWMutex
+	results  map[uint32]*Result
+	cacheDir string
+	pathMap  map[uint32]string // trackID → filePath for cache key
+
+	// keep reports whether a track's cached result must be served as-is even
+	// when stale (a locked track); see SetKeep.
+	keep func(trackID uint32) bool
+
+	statusMu sync.RWMutex
+	cached   int // count of cache hits
+
+	// queue runs the analyses requested through Request (queue.go).
+	queue queue
+
+	// lru orders the results in memory by use, to keep them within
+	// MaxResultBytes (lru.go). Guarded by mu.
+	lru resultLRU
+
+	// MaxResultBytes is the budget for results held in memory; 0 means
+	// DefaultMaxResultBytes. Older results that have a cache file are dropped
+	// to keep within it, and loaded again when needed. Set once at startup.
+	MaxResultBytes int64
+
+	// TotalTracksFn, when set, supplies the library track count used as the
+	// "N tracks" figure in Status() (instead of the in-memory result count,
+	// which only covers analyzed/cache-loaded tracks). Set once at startup.
+	TotalTracksFn func() int
+
+	// gridCarry holds user-edited beat grids rescued from stale-version
+	// cache entries (keyed by file path), re-applied by Set after the
+	// track re-analyzes. Guarded by mu.
+	gridCarry map[string]gridCarry
+
+	// Importer, when set, is tried before running our own DSP on a track:
+	// it returns pre-existing analysis (e.g. parsed from a served rekordbox
+	// USB's ANLZ files) or nil to fall through to AnalyzeTrack. An imported
+	// Result is cached like any other, so the import runs once per track.
+	// Set once at startup, before any analysis is requested.
+	Importer func(trackID uint32, filePath string) *Result
+
+	// OnAnalyzed, when set, writes a result back to its track (the library
+	// row, the artwork it found): called once for every request the queue
+	// finishes with a result, however many requests joined it. Set once at
+	// startup, before any analysis is requested.
+	OnAnalyzed func(trackID uint32, r *Result)
+}
+
+// NewStore creates an in-memory-only analysis store.
+func NewStore() *Store {
+	return &Store{
+		results: make(map[uint32]*Result),
+		pathMap: make(map[uint32]string),
+	}
+}
+
+// NewStoreWithCache creates a store that persists results to disk.
+func NewStoreWithCache(cacheDir string) *Store {
+	os.MkdirAll(cacheDir, 0755)
+	return &Store{
+		results:  make(map[uint32]*Result),
+		cacheDir: cacheDir,
+		pathMap:  make(map[uint32]string),
+	}
+}
+
+// Get returns the analysis result for a track, or nil.
+// Checks disk cache if not in memory.
+func (s *Store) Get(trackID uint32) *Result {
+	s.mu.Lock()
+	r := s.results[trackID]
+	filePath := s.pathMap[trackID]
+	if r != nil {
+		s.touchLocked(trackID)
+	}
+	s.mu.Unlock()
+
+	if r != nil {
+		return s.alignGridOffset(trackID, r)
+	}
+
+	// Try loading from disk cache.
+	if s.cacheDir != "" && filePath != "" {
+		if cached := s.loadFromDisk(filePath, s.keeps(trackID)); cached != nil {
+			cached = withGridOffset(cached)
+			s.mu.Lock()
+			s.putLocked(trackID, cached)
+			s.mu.Unlock()
+			s.incCached()
+			dlog.Infof("analysis-cache: loaded track %d from disk", trackID)
+			return cached
+		}
+	}
+
+	return nil
+}
+
+// SetKeep installs the check for tracks whose cached analysis must survive a
+// cache-version bump or tempo-range change unchanged (locked tracks): Get
+// serves such a result as-is instead of discarding it and re-analyzing.
+func (s *Store) SetKeep(keep func(trackID uint32) bool) {
+	s.mu.Lock()
+	s.keep = keep
+	s.mu.Unlock()
+}
+
+func (s *Store) keeps(trackID uint32) bool {
+	s.mu.RLock()
+	keep := s.keep
+	s.mu.RUnlock()
+	return keep != nil && keep(trackID)
+}
+
+// isImported reports whether a cached result came from rekordbox's own ANLZ
+// files rather than our analysis. Imports set Imported; results cached since
+// version 30, before that flag existed, are recognised by a grid that is
+// neither detected nor hand-edited, which only an import produces.
+func (r *Result) isImported() bool {
+	return r.Imported || (r.CacheVersion >= 30 && !r.GridDetected && !r.GridEdited && len(r.Beats) > 0)
+}
+
+// alignGridOffset returns r shifted to the current grid offset, replacing the
+// stored result when it had to change. Readers may hold r, so a shifted copy
+// is stored rather than mutating r in place.
+func (s *Store) alignGridOffset(trackID uint32, r *Result) *Result {
+	shifted := withGridOffset(r)
+	if shifted != r {
+		s.mu.Lock()
+		if s.results[trackID] == r {
+			s.results[trackID] = shifted
+		}
+		s.mu.Unlock()
+	}
+	return shifted
+}
+
+// withGridOffset returns r unchanged when it already matches the current grid
+// offset (or is not ours to shift: imported or hand-edited grids keep their
+// absolute positions), else a copy with the grid moved by the difference.
+func withGridOffset(r *Result) *Result {
+	cur := GridOffset()
+	if r == nil || !r.GridDetected || r.GridEdited || r.GridOffsetMs == cur {
+		return r
+	}
+	c := *r
+	shiftGrid(&c, cur-r.GridOffsetMs)
+	c.GridOffsetMs = cur
+	return &c
+}
+
+// shiftGrid moves a result's beats and phrase times by delta ms (see
+// offsetBeats for how the start of the grid is handled).
+func shiftGrid(r *Result, delta float64) {
+	if len(r.Beats) == 0 || delta == 0 {
+		return
+	}
+	period := 60000 / r.BPM
+	if len(r.Beats) > 1 {
+		period = r.Beats[1] - r.Beats[0]
+	}
+	beats, db := offsetBeats(r.Beats, delta, period, r.DownbeatIndex)
+	r.DownbeatIndex = ((db % 4) + 4) % 4
+	r.Beats = beats
+	regenerateGrid(r) // rebuild the deck's beat-grid blobs from the moved beats
+	if len(r.Phrases) > 0 {
+		ph := append([]Phrase(nil), r.Phrases...)
+		for i := range ph {
+			if ph[i].EndMs > 0 {
+				ph[i].StartMs += delta
+				ph[i].EndMs += delta
+			}
+		}
+		r.Phrases = ph
+	}
+}
+
+// offsetBeats shifts a grid by delta ms and returns it with the index of the
+// beat that downbeat (an index into beats) now sits on. It keeps the downbeat
+// on the same musical beat and never loses a beat the detector found in the
+// audio: a beat at >= 0 that the shift pushes below zero is clamped to 0
+// rather than dropped (moving that one beat by less than delta). Dropping it
+// would push beat 1 of a track cut right on the downbeat a whole bar later.
+// A positive delta that opens a gap at the start is refilled at the period.
+func offsetBeats(in []float64, delta, period float64, downbeat int) ([]float64, int) {
+	out := make([]float64, 0, len(in)+1)
+	db := downbeat
+	for i, b := range in {
+		v := b + delta
+		if v < 0 {
+			if b >= 0 && len(out) == 0 {
+				v = 0 // a real beat near the start: keep it, at 0
+			} else {
+				// Already negative, or a second beat clamping onto the first
+				// (only when |delta| exceeds a period): nothing real to keep.
+				if i < downbeat {
+					db--
+				}
+				continue
+			}
+		}
+		out = append(out, v)
+	}
+	if period > 0 {
+		for len(out) > 0 && out[0]-period >= 0 {
+			out = append([]float64{out[0] - period}, out...)
+			db++
+		}
+	}
+	return out, db
+}
+
+// LoadStale returns a track's cached result even when its cache version or
+// tempo range no longer matches, and never discards the file. It is for locked
+// tracks, whose hand-corrected grid must be served as-is rather than triggering
+// a re-analysis. A detected grid is still moved to the current user grid
+// offset, as Get does. Returns nil only when there is genuinely no cached
+// analysis.
+func (s *Store) LoadStale(trackID uint32) *Result {
+	s.mu.RLock()
+	r := s.results[trackID]
+	filePath := s.pathMap[trackID]
+	s.mu.RUnlock()
+	if r != nil {
+		return s.alignGridOffset(trackID, r)
+	}
+	if s.cacheDir == "" || filePath == "" {
+		return nil
+	}
+	f, err := os.Open(s.cacheFile(filePath))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var res Result
+	if err := gob.NewDecoder(f).Decode(&res); err != nil {
+		return nil
+	}
+	s.mu.Lock()
+	s.putLocked(trackID, &res)
+	s.mu.Unlock()
+	return s.alignGridOffset(trackID, &res)
+}
+
+// Set stores an analysis result for a track. If a user-edited beat grid was
+// carried over from a stale-version cache entry for this file (see
+// loadFromDisk), it is re-applied here: a cacheVersion bump refreshes the
+// waveforms but must never revert a grid the user fixed by hand.
+func (s *Store) Set(trackID uint32, r *Result) {
+	s.set(trackID, r, false)
+}
+
+// SetIfAbsent stores r only if the track has no result yet, and reports
+// whether it did. Analysis that fills in a missing result uses it: a result
+// stored while that analysis ran (an import storing rekordbox's own, which it
+// may also lock) is kept instead of being overwritten.
+func (s *Store) SetIfAbsent(trackID uint32, r *Result) bool {
+	return s.set(trackID, r, true)
+}
+
+func (s *Store) set(trackID uint32, r *Result, onlyIfAbsent bool) bool {
+	s.mu.Lock()
+	if onlyIfAbsent && s.results[trackID] != nil {
+		s.mu.Unlock()
+		return false
+	}
+	filePath := s.pathMap[trackID]
+	if c, ok := s.gridCarry[filePath]; ok && r != nil && !r.GridEdited {
+		r.Beats = c.beats
+		r.BPM = c.bpm
+		r.DownbeatIndex = c.downbeat
+		r.GridEdited = true
+		r.BeatGrid = nil // regenerate blobs from the carried beats
+		r.BeatGridPQT2 = nil
+		delete(s.gridCarry, filePath)
+		dlog.Infof("analysis-cache: re-applied user-edited beat grid for track %d after re-analysis", trackID)
+	}
+	s.putLocked(trackID, r)
+	s.mu.Unlock()
+
+	// A deliberate replacement (an import, a re-analysis, a grid edit) makes an
+	// analysis still running for the track pointless: its result would be
+	// discarded (keepCurrent), so stop it.
+	if !onlyIfAbsent {
+		s.cancel(trackID)
+	}
+
+	// Persist to disk.
+	if s.cacheDir != "" && filePath != "" {
+		s.saveToDisk(filePath, r)
+	}
+	return true
+}
+
+// Remove drops the in-memory result and path mapping for a track, for use
+// when the track is deleted from the library. The on-disk cache entry is
+// deliberately kept: it is keyed by file path (derived from the audio
+// content, not track state), so re-adding the same file later reuses it
+// instead of re-analyzing. Without this, a deleted track's Result (waveform
+// blobs and all, hundreds of KB) stayed resident until restart.
+func (s *Store) Remove(trackID uint32) {
+	s.mu.Lock()
+	s.dropLocked(trackID)
+	delete(s.pathMap, trackID)
+	s.mu.Unlock()
+	s.forget(trackID)
+}
+
+// Status returns a human-readable status line for the monitor UI.
+func (s *Store) Status() string {
+	s.mu.RLock()
+	total := len(s.results)
+	s.mu.RUnlock()
+	// Prefer the full library track count when available, so "N tracks" means
+	// the library size rather than just how many analyses are loaded.
+	if s.TotalTracksFn != nil {
+		total = s.TotalTracksFn()
+	}
+	cached := s.CachedCount()
+	pending := s.Pending()
+
+	if activity := s.activity(); activity != "" {
+		if pending > 1 {
+			return fmt.Sprintf("%s (%d queued, %d tracks, %d cached)", activity, pending-1, total, cached)
+		}
+		return fmt.Sprintf("%s (%d tracks, %d cached)", activity, total, cached)
+	}
+	if total > 0 {
+		return fmt.Sprintf("Ready (%d tracks, %d cached)", total, cached)
+	}
+	return "Idle"
+}
+
+// Count returns the total number of analyzed tracks in memory.
+func (s *Store) Count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.results)
+}
+
+// CachedCount returns the number of results loaded from disk cache.
+func (s *Store) CachedCount() int {
+	s.statusMu.RLock()
+	defer s.statusMu.RUnlock()
+	return s.cached
+}
+
+func (s *Store) incCached() {
+	s.statusMu.Lock()
+	s.cached++
+	s.statusMu.Unlock()
+}
+
+// TryImport runs the Importer synchronously and returns the track's Result:
+// the import's, stored, or one stored meanwhile (see keepCurrent). It returns
+// nil when no Importer is set or it has nothing for this track.
+// Unlike full analysis, an import is a fast file parse, so callers on a
+// request path (e.g. the dbserver answering a deck's load sequence) can
+// afford to run it inline instead of racing an async import — a deck
+// requests cues milliseconds after metadata, well inside an async window.
+func (s *Store) TryImport(trackID uint32, filePath string) *Result {
+	if s.Importer == nil {
+		return nil
+	}
+	r := s.Importer(trackID, filePath)
+	if r == nil {
+		return nil
+	}
+	return s.keepCurrent(trackID, r)
+}
+
+// keepCurrent stores r, a result filling in a missing one, unless the track
+// gained a result while r was being made; it returns whichever the track now
+// has.
+func (s *Store) keepCurrent(trackID uint32, r *Result) *Result {
+	if s.SetIfAbsent(trackID, r) {
+		return r
+	}
+	s.mu.RLock()
+	cur := s.results[trackID]
+	s.mu.RUnlock()
+	if cur == nil { // removed meanwhile
+		return r
+	}
+	dlog.Infof("analysis: track %d gained an analysis while this one ran; keeping it", trackID)
+	return cur
+}
+
+// SetPath associates a track ID with a file path for cache key generation.
+// Must be called before Get/Set for disk caching to work.
+func (s *Store) SetPath(trackID uint32, filePath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pathMap[trackID] = filePath
+}
+
+func (s *Store) cacheFile(filePath string) string {
+	h := sha256.Sum256([]byte(filePath))
+	return filepath.Join(s.cacheDir, fmt.Sprintf("%x.gob", h[:8]))
+}
+
+// Invalidate drops both the in-memory and on-disk analysis cache for
+// `trackID`, so the next Get() forces a fresh analysis. Used by the
+// "re-analyze" button in the detail drawer when the user wants to
+// recompute beats/key/waveform after editing the source file or
+// suspecting a stale result.
+func (s *Store) Invalidate(trackID uint32) {
+	s.mu.Lock()
+	s.dropLocked(trackID)
+	path := s.pathMap[trackID]
+	s.mu.Unlock()
+	if path == "" || s.cacheDir == "" {
+		return
+	}
+	cacheFile := s.cacheFile(path)
+	if err := os.Remove(cacheFile); err == nil {
+		dlog.Infof("analysis-cache: invalidated track %d (%s)", trackID, cacheFile)
+	}
+}
+
+// InvalidateAll drops every in-memory result so the next Get for each track
+// re-reads the disk cache — where the staleness check re-analyzes anything it
+// now rejects (e.g. after the BPM range changed). On-disk entries are left for
+// that per-track check to discard lazily; nothing is re-analyzed up front.
+func (s *Store) InvalidateAll() {
+	s.mu.Lock()
+	s.dropAllLocked()
+	s.mu.Unlock()
+}
+
+// RenameCachedPath moves the on-disk analysis cache from the slot
+// keyed by `oldPath` to the one keyed by `newPath` so a path remap
+// doesn't force re-analysis. Silently noops when there's no cache.
+func (s *Store) RenameCachedPath(oldPath, newPath string) {
+	if s == nil || s.cacheDir == "" || oldPath == newPath {
+		return
+	}
+	from := s.cacheFile(oldPath)
+	to := s.cacheFile(newPath)
+	if from == to {
+		return
+	}
+	if _, err := os.Stat(from); err != nil {
+		return
+	}
+	if err := os.Rename(from, to); err != nil {
+		dlog.Warnf("analysis-cache: rename %s -> %s: %v", from, to, err)
+	}
+}
+
+// saveToDisk writes a result's cache file, atomically: a crash or kill
+// mid-write leaves the old file (or none), never a truncated one. No fsync:
+// the cache can be rebuilt, and an import writes thousands of these.
+func (s *Store) saveToDisk(filePath string, r *Result) {
+	path := s.cacheFile(filePath)
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(r); err != nil {
+		dlog.Errorf("analysis-cache: encode %s: %v", path, err)
+		return
+	}
+	if err := fsutil.WriteCache(path, buf.Bytes(), 0644); err != nil {
+		dlog.Errorf("analysis-cache: write %s: %v", path, err)
+	}
+}
+
+// loadFromDisk reads a cached result. A stale one (older cache version, or a
+// different tempo range) is normally discarded so the track re-analyzes, but
+// it is served as-is when keep is set (a locked track) or when it was
+// imported: rekordbox's grid and waveforms do not go stale when our own
+// analysis changes.
+func (s *Store) loadFromDisk(filePath string, keep bool) *Result {
+	path := s.cacheFile(filePath)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var r Result
+	if err := gob.NewDecoder(f).Decode(&r); err != nil {
+		dlog.Warnf("analysis-cache: decode %s: %v", path, err)
+		return nil
+	}
+	stale := r.CacheVersion != cacheVersion
+	if curMin, curMax := TempoRange(); r.TempoMinBPM != curMin || r.TempoMaxBPM != curMax {
+		stale = true
+	}
+	if stale && (keep || r.isImported()) {
+		dlog.Infof("analysis-cache: stale (version %d or tempo range) but the track is locked or imported — keeping %s", r.CacheVersion, filepath.Base(path))
+		return &r
+	}
+	if r.CacheVersion != cacheVersion {
+		// A user-edited beat grid must survive the bump: stash it for Set()
+		// to re-apply after re-analysis, and keep the file on disk so the
+		// edit also survives a restart that happens before the track is
+		// re-analyzed (the stash is in-memory only).
+		if r.GridEdited {
+			s.mu.Lock()
+			if s.gridCarry == nil {
+				s.gridCarry = make(map[string]gridCarry)
+			}
+			s.gridCarry[filePath] = gridCarry{beats: r.Beats, bpm: r.BPM, downbeat: r.DownbeatIndex}
+			s.mu.Unlock()
+			dlog.Infof("analysis-cache: stale version %d (want %d) but grid is user-edited — re-analyzing %s, keeping the edited grid", r.CacheVersion, cacheVersion, filepath.Base(path))
+			return nil
+		}
+		dlog.Infof("analysis-cache: stale version %d (want %d), discarding %s", r.CacheVersion, cacheVersion, filepath.Base(path))
+		os.Remove(path)
+		return nil
+	}
+	if curMin, curMax := TempoRange(); r.TempoMinBPM != curMin || r.TempoMaxBPM != curMax {
+		// The BPM range changed since this was cached. The BPM and grid were fit
+		// under the old range, so re-analyze under the new one. Unlike a version
+		// bump we do not carry a user-edited grid across: an edit made at the old
+		// tempo is meaningless once the tempo refolds.
+		dlog.Infof("analysis-cache: tempo range changed (was %g-%g, now %g-%g), re-analyzing %s",
+			r.TempoMinBPM, r.TempoMaxBPM, curMin, curMax, filepath.Base(path))
+		os.Remove(path)
+		return nil
+	}
+	return &r
+}
+
+// ReanalyzeParts selects which parts of a track's analysis a re-run recomputes.
+// The grid (BPM, beats, downbeat, key, phrases) and the waveform blobs are
+// independent DSP outputs — neither reads the other — so either can be redone
+// while the other is preserved.
+type ReanalyzeParts int
+
+const (
+	PartsAll      ReanalyzeParts = iota // grid + waveform (a full analysis)
+	PartsGrid                           // BPM, beats, downbeat, key, phrases
+	PartsWaveform                       // the color-waveform blobs only
+)
+
+// AnalyzeTrack decodes and analyzes a single track (grid and waveform).
+func AnalyzeTrack(filePath string) (*Result, error) {
+	return AnalyzeTrackContext(context.Background(), filePath)
+}
+
+// AnalyzeTrackContext is AnalyzeTrack, stopping early when ctx ends: the
+// decoder is killed, and the analysis checks ctx between its stages (each up
+// to about a second), then returns ctx's error.
+func AnalyzeTrackContext(ctx context.Context, filePath string) (*Result, error) {
+	samples, err := DecodePCMContext(ctx, filePath, AnalysisRate)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r := &Result{
+		CacheVersion: cacheVersion,
+		Duration:     uint16(float64(len(samples)) / float64(AnalysisRate)),
+		Artwork:      ExtractArtwork(filePath),
+	}
+	beatResult, err := analyzeGridInto(ctx, r, samples, filePath)
+	if err != nil {
+		return nil, err
+	}
+	if err := waveformEncoder.Encode(ctx, samples, AnalysisRate, r, beatResult); err != nil { // installed wire format (Pioneer)
+		return nil, err
+	}
+	return r, nil
+}
+
+// Reanalyze recomputes selected parts of an existing analysis from the audio,
+// preserving the rest. PartsAll (or a nil existing) is a full AnalyzeTrack.
+// PartsGrid redoes the grid/key/phrases and keeps the waveform; PartsWaveform
+// redoes the waveform and keeps the (possibly hand-corrected) grid.
+func Reanalyze(filePath string, existing *Result, parts ReanalyzeParts) (*Result, error) {
+	if parts == PartsAll || existing == nil {
+		return AnalyzeTrack(filePath)
+	}
+	samples, err := DecodePCM(filePath, AnalysisRate)
+	if err != nil {
+		return nil, err
+	}
+	clone := *existing // reassign slices below; never mutate the cached Result in place
+	r := &clone
+	r.CacheVersion = cacheVersion
+	r.Duration = uint16(float64(len(samples)) / float64(AnalysisRate))
+
+	switch parts {
+	case PartsGrid:
+		// Without a context to end, the grid can't fail.
+		beatResult, _ := analyzeGridInto(context.Background(), r, samples, filePath)
+		r.GridEdited = false // a fresh detection replaces any prior hand edit
+		if len(r.WaveDetail) == 0 {
+			waveformEncoder.Encode(context.Background(), samples, AnalysisRate, r, beatResult)
+		}
+	case PartsWaveform:
+		// Keep the grid exactly as stored; encode the waveform against it.
+		waveformEncoder.Encode(context.Background(), samples, AnalysisRate, r, beatResultFrom(r))
+	}
+	return r, nil
+}
+
+// analyzeGridInto computes the grid, key, and phrases from samples and writes
+// them into r, returning the BeatResult (the waveform encoder needs it).
+func analyzeGridInto(ctx context.Context, r *Result, samples []float32, filePath string) (*BeatResult, error) {
+	// Compensate the lossy encoder delay so lossless grids are not shifted late.
+	beatResult := detectBeats(ctx, samples, AnalysisRate, EncoderDelayMs(filePath))
+	if beatResult == nil {
+		return nil, ctx.Err()
+	}
+	camelot, standard := DetectKey(samples, AnalysisRate)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// Downbeat index into Beats (the first beat at/after the detected downbeat).
+	downbeatIdx := 0
+	for i, b := range beatResult.Beats {
+		if b >= beatResult.Downbeat-0.5 {
+			downbeatIdx = i
+			break
+		}
+	}
+
+	phrases := DetectPhrases(samples, AnalysisRate, beatResult.BPM, beatResult.Downbeat)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	AnnotateVocals(samples, AnalysisRate, beatResult.BPM, beatResult.Downbeat, phrases)
+	SetPhraseTimes(phrases, beatResult.Beats, beatResult.BPM)
+
+	r.BPM = beatResult.BPM
+	r.KeyCamelot = camelot
+	r.KeyStandard = standard
+	r.Beats = beatResult.Beats
+	r.DownbeatIndex = downbeatIdx
+	r.Phrases = phrases
+	r.TempoMinBPM, r.TempoMaxBPM = TempoRange()
+	r.GridDetected, r.GridOffsetMs = true, GridOffset() // DetectBeats applied the offset
+	return beatResult, nil
+}
+
+// beatResultFrom reconstructs a BeatResult from a Result's stored grid, so the
+// waveform can be encoded without recomputing the grid.
+func beatResultFrom(r *Result) *BeatResult {
+	downbeat := 0.0
+	if r.DownbeatIndex >= 0 && r.DownbeatIndex < len(r.Beats) {
+		downbeat = r.Beats[r.DownbeatIndex]
+	}
+	return &BeatResult{BPM: r.BPM, Beats: r.Beats, Downbeat: downbeat}
+}
+
+// AnalyzeAll processes all tracks using a worker pool.
+// Sets each track's Tempo field from detected BPM.
+// Returns a Store with waveform data.
+// AnalyzeAll processes all tracks using a worker pool.
+// Results are stored in the provided store. If store is nil, a new one is created.
+// If progress is non-nil, it is called after each track with (done, total).
+func AnalyzeAll(tracks []*pdb.Track, workers int, store *Store, progress func(done, total int)) *Store {
+	if store == nil {
+		store = NewStore()
+	}
+
+	if workers < 1 {
+		workers = 1
+	}
+
+	type job struct {
+		track *pdb.Track
+	}
+
+	jobs := make(chan job, len(tracks))
+	var wg sync.WaitGroup
+	var done int64
+	total := len(tracks)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				t := j.track
+				var result *Result
+				var err error
+				if store.Importer != nil {
+					result = store.Importer(t.ID, t.FilePath)
+				}
+				if result == nil {
+					result, err = AnalyzeTrack(t.FilePath)
+				}
+				if err != nil {
+					dlog.Errorf("analysis: %s: %v", t.FileName, err)
+				} else {
+					// Set BPM on track if not already set from tags.
+					if t.Tempo == 0 && result.BPM > 0 {
+						t.Tempo = uint32(result.BPM * 100)
+					}
+					// Set duration if not already set.
+					if t.Duration == 0 && result.Duration > 0 {
+						t.Duration = result.Duration
+					}
+					// Set key if not already set.
+					if t.Key == "" && result.KeyCamelot != "" {
+						t.Key = result.KeyCamelot
+					}
+					// Set artwork ID if artwork was extracted.
+					if result.Artwork != nil && t.ArtworkID == 0 {
+						t.ArtworkID = t.ID // use track ID as artwork ID
+					}
+
+					store.Set(t.ID, result)
+					artSize := len(result.Artwork)
+					dlog.Infof("analysis: %s BPM=%.1f key=%s (%s) dur=%ds art=%dB", t.FileName, result.BPM, result.KeyCamelot, result.KeyStandard, result.Duration, artSize)
+				}
+				if progress != nil {
+					n := int(atomic.AddInt64(&done, 1))
+					progress(n, total)
+				}
+			}
+		}()
+	}
+
+	for i := range tracks {
+		jobs <- job{track: tracks[i]}
+	}
+	close(jobs)
+	wg.Wait()
+
+	return store
+}
