@@ -1,0 +1,14 @@
+# ~/.config/systemd/user/vynull.service — edit the interface, paths and listen address.
+[Unit]
+Description=Vynull DJ library (Pro DJ Link)
+After=network-online.target
+
+[Service]
+ExecStart=%h/vynull-plus/vynull --interface eth0 --mode rekordbox --device-name Vynull-Library --data-dir %h/.local/share/vynull --web --listen 0.0.0.0:9443 --tui=false --mpris=false
+# Where the optional review service listens (default shown).
+Environment=VYNULL_REVIEW_URL=http://127.0.0.1:9444
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

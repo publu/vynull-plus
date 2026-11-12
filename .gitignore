@@ -11,3 +11,27 @@ __pycache__/
 *.flac
 data-dir*/
 tmp/
+
+# --- vynull-plus: local data never committed ---
+/vynull
+lab/.venv/
+**/__pycache__/
+review/review.sqlite*
+review/measured-audio.json
+review/mix-jobs/
+lab/**/*.lock
+lab/**/*cache*/
+lab/**/features/
+lab/**/halo_features/
+lab/**/embeddings/
+lab/**/renders/
+lab/**/strict-stems/
+lab/**/*progress*.json
+lab/**/*.tmp.npz
+lab/**/*.tmp.json
+lab/library_lab_v1/*.json
+lab/library_search_v2/*.json
+lab/discovery_rounds_v1/*.json
+lab/phrase_bridges_v1/*.json
+lab/raveform_v1/
+autocues/

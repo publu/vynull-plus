@@ -1,0 +1,51 @@
+{
+  "version": "bar-phase-preview-gate-v1",
+  "task": "Locate the first beat of a four-beat bar within an existing regular beat grid; not tempo estimation or within-beat onset repair.",
+  "data": "Existing annotated recordings in the original component-isolated train/validation/test partitions. No new downloads, consumed fresh timing inputs or independent timing model scores.",
+  "scope": "A supporting alignment/loop experiment; not evidence of song-pair compatibility or perceptual mix quality.",
+  "window_beats": 32,
+  "stride_beats": 16,
+  "beat_match_limit_seconds": 0.08,
+  "beat_match_limit_period_fraction": 0.15,
+  "label_integrity": "Every beat must match a unique consecutive manual beat and the complete 1-2-3-4 sequence; reject missing/extra beats and irregular windows.",
+  "features": "Beat-scale raw acoustic contexts, excluding all time/position/BPM fields. Seventy-six per-beat descriptors, local median/IQR normalization, four phase pools of means and standard deviations; rotate pools around each proposed downbeat.",
+  "feature_floor": 0.01,
+  "invariance": "No absolute candidate-index input. One shared scorer evaluates all four rotations; rolling the input must roll the scores.",
+  "max_leaf_nodes": [
+    7,
+    15
+  ],
+  "iterations": 100,
+  "min_samples_leaf": 150,
+  "l2_regularization": 30,
+  "learning_rate": 0.06,
+  "weighting": "Each track has equal total mass; candidate weights are renormalized to the candidate count. Each window has four candidates, exactly one positive.",
+  "temperature_grid": [
+    0.5,
+    1,
+    2,
+    4
+  ],
+  "confidence_thresholds": [
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9,
+    0.95,
+    0.975,
+    0.99
+  ],
+  "calibration": "Choose tree size and temperature by validation track-weighted multiclass log loss only. Then select a correction threshold on validation.",
+  "validation_gate": "At least 10% coverage of synthetic wrong bar claims; at least 90% corrected-claim precision; at most 5% false changes when the supplied claim is already correct; positive improvement over the real automatic-grid phase-zero baseline.",
+  "test_gate": "Same criteria on held-out phase-model source IDs, plus positive lower bound of track-bootstrap 95% natural-grid improvement. No test tuning.",
+  "bootstrap_repetitions": 10000,
+  "seed": 20261111,
+  "deployment": "No live library grid writes. Do not enable even preview correction unless the fixed offline gate passes; musical listening validation remains separate.",
+  "limitations": [
+    "Source partitions were used by earlier timing/structure experiments; this is a new-task held-out benchmark, not an untouched overall project confirmation.",
+    "A pre-fit metadata audit inspected split sizes and phase counts, not any phase-model predictions.",
+    "Only clean one-to-one automatic/manual beat correspondences are evaluated; inference needs the same grid-regularity guard.",
+    "Four-beat meter assumed. EDM corpus transfer to other styles remains unproven."
+  ]
+}

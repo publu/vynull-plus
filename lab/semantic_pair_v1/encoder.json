@@ -1,0 +1,14 @@
+{
+  "model": "laion/larger_clap_music",
+  "revision": "a0b4534a14f58e20944452dff00a22a06ce629d1",
+  "weights": "pytorch_model.bin",
+  "device": "cuda",
+  "encoder_parameters": 68611864,
+  "trainable_encoder_parameters": 0,
+  "window_seconds": 10,
+  "grid_stride_bars": 4,
+  "window_position": "5 seconds before candidate, clamped to zero",
+  "source": "https://huggingface.co/laion/larger_clap_music",
+  "role": "Frozen music-semantic features; not a beat tracker or a mix-quality predictor",
+  "pretraining_overlap_warning": "Pretrained corpus overlap with Raveform is unknown; downstream track-disjoint split does not establish pretraining independence."
+}

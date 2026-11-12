@@ -1,0 +1,14 @@
+# ~/.config/systemd/user/vynull-review.service — optional suggestions / request queue / mix previews.
+[Unit]
+Description=Vynull review service (suggestions, request queue, mix previews)
+After=vynull.service
+
+[Service]
+WorkingDirectory=%h/vynull-plus/review
+ExecStart=%h/vynull-plus/lab/.venv/bin/python %h/vynull-plus/review/dj_review.py
+Environment=VYNULL_API=http://127.0.0.1:9443/api/
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

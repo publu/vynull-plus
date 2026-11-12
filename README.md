@@ -1,895 +1,106 @@
-# Vynull
+# vynull-plus
 
-[![CI](https://github.com/vynulldev/vynull/actions/workflows/ci.yml/badge.svg)](https://github.com/vynulldev/vynull/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/vynulldev/vynull?color=ff7714&label=release)](https://github.com/vynulldev/vynull/releases)
-[![License: GPLv3](https://img.shields.io/badge/license-GPLv3-ff7714)](LICENSE)
-[![Go](https://img.shields.io/github/go-mod/go-version/vynulldev/vynull?color=ff7714)](go.mod)
-![Platform](https://img.shields.io/badge/platform-linux%20x86--64%20%7C%20arm64-ff7714)
+A modified build of **[Vynull](https://github.com/vynulldev/vynull)**, a Linux DJ library that serves your music
+straight to Pioneer CDJ/XDJ decks over Pro DJ Link, with no rekordbox and no USB export. The repo adds:
 
-Vynull is a DJ library application for Linux that interfaces directly with Pioneer CDJ/XDJ hardware: load tracks from your PC straight onto the decks over Pro DJ Link, with no rekordbox, no USB sticks, and no export step. Players see your machine as a connected rekordbox instance (or a CDJ-USB source) and browse and load your music with waveforms, beat grids, and cues; DJM mixers are tracked on the link too. Vynull analyzes tracks itself, includes a browser-based library manager, and imports your existing rekordbox or Traktor library in one click.
+- **USB tab.** Browse and search the rekordbox USB/SD that's plugged into any CDJ on the link: title, artist,
+  album, genre, label, key, BPM, year, filename and comment. It shows the stick's **playlists and folders** in the
+  stick's own order, and has **▶N** buttons that load a track from that stick onto any deck. The stick's
+  `export.pdb` is downloaded once over NFS and cached, so searching never touches the decks.
+- **Cue labels.** Named hot/memory cues that survive the deck saving and moving them.
+- **NEXT UP panel** (optional, needs `review/`). Library suggestions for the loaded track (tempo, key, genre,
+  measured sound), a request queue, and listening feedback.
+- **Mix lab** (optional, experimental; needs `review/` + `lab/`). A librosa/scikit-learn/CLAP pipeline that picks
+  song parts, aligns beats and bars, and renders short **auto-mix previews** you can rate.
 
-## Before you start
+Upstream Vynull's own documentation is kept in **[README.upstream.md](README.upstream.md)**. Read its
+"Before you start" section. This is hobby software that speaks an undocumented protocol. Don't use it at a gig,
+and back up your library first.
 
-This is a hobby project. I built it to learn some Go, poke at my CDJs, and see how far I could get building something real with Claude — further than I expected, as it turns out. It speaks a protocol Pioneer never documented, which I only understand thanks to other people's reverse-engineering work (see [Acknowledgements](#acknowledgements)). Expect bugs and the occasional strange deck behaviour. It is not affiliated with Pioneer DJ / AlphaTheta.
+> Not affiliated with Pioneer DJ / AlphaTheta, or with the upstream Vynull project.
 
-None of it is polished, and it's not meant to be taken as a finished product. There are bugs, some features are half-finished or only work in certain setups, and not everything behaves the way it should. A fair amount of the code is me figuring things out as I went rather than the cleanest or most correct way to do it — you'll find rough edges, inconsistent corners, and the occasional "why is it written like that." I've tried to be honest in the docs about what's solid and what isn't, but treat the whole thing as a work in progress. Bug reports and PRs are welcome if you want to help sand it down.
+---
 
-Use it at your own risk, and back up your rekordbox library before importing anything. I wouldn't run it at a real gig, and if it does something strange to your network or your gear, that's yours to sort out.
+## 1. Vynull (required)
 
-## Features
-
-- **Virtual CDJ/Rekordbox** on the Pro DJ Link network (UDP ports 50000/50001/50002)
-- **Web UI** — browser-based library manager (`--web`): browse/search, edit metadata, manage cues/tags/playlists, view live players, zoom waveform with beat grid + beat-jump, and configure CDJ settings
-- **Browse tracks** on CDJs by artist, album, genre, BPM, key, label, year, remixer, folder
-- **Import your library** — from **rekordbox** (`rekordbox.xml`, an encrypted `master.db`, or a full library-backup `.zip`) or **Traktor** (`collection.nml`). A rekordbox import brings tracks, MyTags (with categories), track colors, (smart) playlists, cue points (hot + memory, with colors/loops), ANLZ analysis (waveforms/beat grids/phrases), and artwork; a Traktor import brings tracks, playlists, and cues
-- **Smart playlists** — rekordbox rule sets imported and evaluated live (BPM/key/genre/date/tag/… conditions)
-- **Related tracks** — tracks that mix well with the selected one (compatible key on the Camelot wheel, tempo within a few percent including half/double time, same genre, and rekordbox's own related-track pairs when imported), shown in the web UI's track drawer and from `GET /api/tracks/{id}/related`. On the CDJ's MATCHING browse, a track with imported rekordbox pairs lists exactly those, as rekordbox does; any other track lists these suggestions
-- **Serve a rekordbox USB directly** — point `--music-dir` at an exported stick: its playlists appear on the decks and in the web UI, tracks keep rekordbox's own beat grids, waveforms and hot/memory cues, and the stick's database replaces the tag scan (web UI, decks and stick share one track-ID space)
-- **DJM mixer awareness** — surfaces DJM channel/master state on the link
-- **Native FLAC/WAV/AIFF playback** — CDJ decodes lossless formats directly over NFS
-- **Color waveforms** on the CDJ (PWV4 overview + PWV5 scrolling, generated with time-domain Butterworth filter banks calibrated against rekordbox's rendering); honors the CDJ "waveform color" setting (blue / RGB / 3-band) in both the deck and the web UI
-- **BPM detection** with autocorrelation + a perceptual tempo prior, coherence-verified integer/half-integer snap, and a DP beat tracker. Detects **60–200 BPM**; set an **Analysis BPM range** (Settings → Library Source, or `--bpm-range 90-180`) so fast genres like drum & bass lock onto the true tempo instead of its half/third. Tracks above 200 BPM are analyzed at a sub-harmonic (usually half-tempo) — 200 is the current ceiling
-- **Key detection** using chromagram analysis (octaves 4-7, Krumhansl-Kessler profiles)
-- **Beat grid** generation phase-locked via a multiband onset tempogram (modelled on rekordbox's reverse-engineered 25-band novelty), windowed clarity-weighted phase, and a gated half-beat correction
-- **Beat-grid offset** — detected grids match rekordbox by default; if they consistently sound a little early or late to you, shift them all by a few ms (Settings → Library Source, or `--grid-offset`). Hand-corrected and imported grids are never moved
-- **Phrase/song structure** detection (PSSI format)
-- **Cue point management** — hot and memory cues: save/load from the CDJ, create either kind in the web UI (+ CUE / + MEM), add/edit/delete via HTTP API, with color support
-- **NFS v2 file server** streams audio to CDJs (with optional FLAC/WAV/AIFF to MP3 transcoding)
-- **Lazy analysis** mode for instant startup (tracks analyzed on-demand when CDJs request them); artwork is also extracted lazily
-- **Library mode** with no music directory required (add tracks dynamically via HTTP API)
-- **Editable metadata** — edit label/remixer/original-artist/mix-name/comment and relink a moved track's file path (library DB only — never touches the audio file); missing files are flagged
-- **Analysis API** — access beat grids, waveforms, cue points; manually adjust BPM, phase, downbeat
-- **Analysis caching** to disk with versioned cache invalidation
-- **CDJ settings** — waveform size/color/overview, key display, track-detail column, root-menu layout via API with live notification to CDJs
-- **Tag management** — user-defined tags, tag categories, and track colors via API
-- **Remote track loading** via API (auto-adds tracks not in library)
-- **USB export** — write a rekordbox-compatible USB structure (PDB + ANLZ + settings) from the library
-- **Live monitor** TUI showing connected CDJs, playback state, track history, and analysis status
-- **External-source metadata** — when a deck plays a track from its own USB/SD (not from us), the monitor and web PLAYERS view show its real title, artist, key, cover art, waveform, and cue points, read from that player's rekordbox export and ANLZ over NFS, instead of a wrong local ID match
-- **MPRIS now-playing** — the audible deck published on the D-Bus session bus: GNOME/KDE media controls and lock screens, playerctl, status-bar widgets, and KDE Connect phone mirroring see what's playing (read-only; `--mpris=false` to disable)
-- **Now-playing overlay** for streaming — a transparent OBS browser source at `/overlay` showing the audible deck's track (artwork, title, artist, BPM/key), driven by the live link state
-
-## Requirements
-
-- Linux (tested on x86_64)
-- Go 1.21+
-- `ffmpeg` in PATH (for audio decoding)
-- Python 3 — **only** to import an encrypted `master.db` or a library-backup
-  `.zip` (it shells out to `tools/rekordbox_dump.py`); XML, Traktor NML, and
-  everything else need no Python. The `sqlcipher3` dependency is provisioned
-  automatically into an isolated venv (`~/.vynull/python-venv`) on first use —
-  no manual pip install required
-- Network interface on the same subnet as CDJs (typically 169.254.x.x link-local)
-- Permission to bind the RPC portmapper on **UDP 111** — see below (rekordbox mode does not need it)
-
-### Port 111 (CDJ mode only)
-
-A deck that links to us as a **CDJ-USB source** (`--mode cdj`) finds our NFS mount by
-querying the standard RPC portmapper on **UDP 111**, a privileged port (<1024). If we
-can't bind it, browsing still works (that's dbserver-only over TCP) but **track loads
-fail** — the deck can't locate the file server. The deck chooses port 111; we can't
-move it to a higher port.
-
-**rekordbox mode (the default) is unaffected** — for a rekordbox source the deck queries
-Pioneer's non-standard port **50111**, which is unprivileged, so it works without any
-extra setup. Prefer `--mode rekordbox` unless you specifically need to appear as a CDJ.
-
-If you do run `--mode cdj`, grant port 111 with **one** of (no need to run the whole app
-as root):
+You need Linux, Go 1.25.7+, `ffmpeg`, and a wired network shared with your CDJs.
 
 ```bash
-# Best: lower the privileged-port threshold (system-wide, survives rebuilds)
-sudo sysctl -w net.ipv4.ip_unprivileged_port_start=111
-
-# Or: grant just this binary the capability (re-run after every `go build`)
-sudo setcap 'cap_net_bind_service=+ep' ./vynull
-
-# Or: redirect 111 → our unprivileged 50111 listener
-sudo iptables -t nat -A PREROUTING -i eth1 -p udp --dport 111 -j REDIRECT --to-ports 50111
-
-# Or simply run with sudo
+git clone https://github.com/publu/vynull-plus && cd vynull-plus
+go build -o vynull .
+./vynull --interface eth0 --music-dir ~/Music --web --listen 0.0.0.0:9443
 ```
 
-The Makefile wraps the run commands: `make run MUSIC=<dir>` starts the default
-rekordbox mode, and `make run-cdj MUSIC=<dir>` starts CDJ mode (which needs
-port 111 granted as above).
+Open `http://<this-machine>:9443/`. The decks see the machine as a rekordbox source. The default `--mode rekordbox` needs no root; `--mode cdj` needs port 111, see README.upstream.md. To use the **USB tab**, plug
+a rekordbox-exported stick into any linked CDJ and open the **USB** tab. Prebuilt linux-amd64 binaries are on the
+[releases page](https://github.com/publu/vynull-plus/releases).
 
-## Quick Start
+There's a systemd user unit you can adapt in `deploy/systemd/vynull.service`.
 
-### Download
+## 2. Review service (optional): NEXT UP panel
 
-Each [release](https://github.com/vynulldev/vynull/releases) has static Linux binaries for amd64 and arm64. The same page has nightly prereleases (`nightly-YYYY-MM-DD`): `main`, built each day it changes, once the full test suite passes; the newest 7 are kept. They have the newest fixes, without the checks a release gets, so don't take one to a gig. To check a nightly download:
+This is plain Python 3.11+ with the standard library only. It keeps its data in `review/review.sqlite`.
 
 ```bash
-sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify vynull-nightly-YYYY-MM-DD-linux-amd64.tar.gz --repo vynulldev/vynull
+python3 review/dj_review.py          # listens on 127.0.0.1:9444
 ```
 
-### Build
+| Variable | Default | |
+|---|---|---|
+| `VYNULL_API` | `http://127.0.0.1:9443/api/` | where Vynull's API is |
+| `DJ_REVIEW_HOST` / `DJ_REVIEW_PORT` | `127.0.0.1` / `9444` | listen address |
+| `DJ_REVIEW_DIR` | `review/` | sqlite DB, mix-job folders, `measured-audio.json` |
+| `VYNULL_REVIEW_URL` (set on **vynull**) | `http://127.0.0.1:9444` | where Vynull proxies `/api/review/` |
+
+If the service isn't running, the NEXT UP panel just doesn't appear. With only Vynull's own analysis, you get
+suggestions based on tempo, key and genre, plus the request queue and feedback.
+
+**`measured-audio.json`** (per-track sound descriptors and measured sections) unlocks the "similar sound"
+scoring, the **PARTS** view and the mix lab below. It was produced by a separate analyzer that is **not included
+here**. Its schema is whatever `review/section_matches.py` and `lab/semantic_pair_v1/halo_planner.py` read:
+`{track_id: {features: {...}, sections: [{start_seconds, end_seconds, label, key, tempo_bpm, energy_change_db,
+core_vector, texture_vector, ...}]}}`.
+
+## 3. Mix lab (optional, experimental)
+
+`lab/` holds the analysis and rendering code the review service runs for **AUTO MIX PREVIEW / LOOP PREVIEW**, plus
+the batch library analyses:
+
+| Path | What |
+|---|---|
+| `semantic_pair_v1/` | CLAP (`laion/larger_clap_music`) music-semantic features + the part/pair planner |
+| `part_alignment_v1/` | beat refinement, loop finding, beat-warped live rendering (rubberband + ffmpeg) |
+| `bar_phase_v1/` | bar-phase (downbeat) correction gate |
+| `phrase_bridges_v1/` | instrumental-loop to vocal-phrase "bridge" transitions (Demucs vocals) |
+| `library_lab_v1/`, `library_search_v2/`, `discovery_rounds_v1/` | librosa batch analyses: overlap chroma/onset checks, deep-merge percussion analysis, library pulse screening, match catalog, vocal-overlap audit |
+| `tempo_alias_v1/`, `tempo_grid_v1/`, `djmix_grid_v2/` | tempo-alias and grid feature helpers |
+
+The lab expects the decks' audio files to be readable on the same machine (it reads `file_path` from Vynull's
+API).
 
 ```bash
-make build
+sudo apt install ffmpeg rubberband-cli
+python3 -m venv lab/.venv
+lab/.venv/bin/pip install -r lab/requirements.txt   # add --extra-index-url https://download.pytorch.org/whl/cpu for CPU torch
+LAB_PYTHON=$PWD/lab/.venv/bin/python lab/.venv/bin/python review/dj_review.py
 ```
 
-### Library Mode (recommended)
-
-Start with no music directory. Add tracks dynamically via the HTTP API:
-
-```bash
-./vynull --interface eth1
-```
-
-This defaults to `--mode rekordbox`, which needs no privileged ports. Use
-`--mode cdj` to appear as a CDJ-USB source instead (requires UDP 111 — see
-Requirements).
-
-Then add tracks:
-
-```bash
-# Add a single file
-curl -X POST http://localhost:9443/api/tracks/add \
-  -d '{"paths":["/path/to/track.mp3"]}'
-
-# Add an entire directory (use find)
-find /path/to/music -name "*.mp3" -o -name "*.flac" -o -name "*.m4a" | \
-  jq -R -s 'split("\n") | map(select(length > 0)) | {paths: .}' | \
-  curl -X POST http://localhost:9443/api/tracks/add -d @-
-```
-
-Tracks are analyzed in the background and cached to `~/.vynull/`.
-
-### Web UI
-
-Add `--web` to serve a browser-based library manager alongside the JSON API.
-By default it listens on `127.0.0.1:9443`; use `--listen 0.0.0.0:9443` to reach
-it from another device on the LAN.
-
-```bash
-./vynull --interface eth1 --mode rekordbox --web --listen 0.0.0.0:9443
-# then open http://<this-machine>:9443/
-```
-
-The UI provides a sortable/searchable library table, an editable track-detail
-drawer (metadata, cues, tags, file path, zoom waveform with beat grid +
-beat-jump), a live PLAYERS view of connected CDJs/mixers, playlist + tag
-management, USB export, and a SETTINGS panel that pushes CDJ display settings
-live.
-
-For streaming, `http://<this-machine>:9443/overlay` is a transparent
-now-playing overlay you can add as an OBS browser source — it shows the audible
-deck's track (artwork, title, artist, BPM/key) and updates live.
-
-### Import your library
-
-Import an existing library — from **rekordbox** (a `rekordbox.xml` export, an
-encrypted `master.db`, or a full library-backup `.zip`) or **Traktor** (a
-`collection.nml`):
-
-```bash
-# rekordbox XML export, or a Traktor collection.nml — no key needed
-curl -X POST http://localhost:9443/api/import/rekordbox \
-  -F 'file=@/path/to/rekordbox.xml'
-
-# Encrypted master.db or a library-backup .zip (pass the 64-hex SQLCipher
-# key for your own database)
-curl -X POST http://localhost:9443/api/import/rekordbox \
-  -F 'file=@/path/to/backup.zip' -F 'key=<64-hex sqlcipher key>'
-```
-
-A rekordbox `.zip`/`.db` import brings in tracks, MyTags (with their
-categories), track colors, (smart) playlists, cue points (hot + memory), ANLZ
-analysis (waveforms + beat grids + phrases), and artwork; a Traktor
-`collection.nml` brings tracks, playlists, and cues. The web UI's LIBRARY tab
-has an import button for the same flow.
-Reading an encrypted `master.db` requires Python 3 with the `sqlcipher3`
-package (it shells out to `tools/rekordbox_dump.py`); XML, NML, and everything
-else need no Python. If the system python3 doesn't already have `sqlcipher3`,
-vynull provisions it automatically into an isolated venv at
-`~/.vynull/python-venv` (pip-installing the package there, first import only) —
-the system python is never touched. Set `VYNULL_PYTHON=/path/to/python3` to
-point at a specific interpreter instead.
-
-### Directory Mode
-
-Scan a music directory at startup:
-
-```bash
-./vynull --interface eth1 --music-dir /path/to/music --lazy-analysis
-```
-
-### Serve a rekordbox USB
-
-Point `--music-dir` at an existing rekordbox-exported USB drive and Vynull
-serves the stick's own database instead of scanning tags:
-
-```bash
-./vynull --interface eth1 --music-dir /media/usb
-```
-
-Decks and the web UI get the stick's playlists, rekordbox's own beat
-grids, waveforms and hot/memory cues (our analyzer only runs for tracks
-with missing analysis), and everything shares the stick's track IDs. The
-stick's content is treated as read-only — its playlists can't be edited
-from the web UI.
-
-OneLibrary sticks work when exported with older-player compatibility:
-Vynull reads the classic `PIONEER/rekordbox/export.pdb` half of the
-dual-format layout (the encrypted OneLibrary database itself is not yet
-supported).
-
-The same works in CDJ mode (`--mode cdj`, appears as a CDJ-USB source
-instead of a rekordbox laptop) — that mode needs UDP 111; see "Port 111
-(CDJ mode only)" for sudo-free options.
-
-### Generate USB Structure
-
-Create a rekordbox-compatible USB structure from a music directory:
-
-```bash
-./vynull --generate /media/usb --music-dir /path/to/music
-```
-
-## CLI Subcommands
-
-With a server running, the same binary doubles as a shell client for it —
-handy for scripting (fzf/rofi pickers, watch-folder cron jobs) without
-touching curl:
-
-```bash
-vynull search caribou            # list matching tracks (ID, BPM, key, ...)
-vynull search --json | jq ...    # machine-readable, for pipelines
-vynull add ~/Music/new-crate     # add files or folders; analysis runs in background
-vynull load 42 2                 # load track 42 on deck 2
-vynull load "encounter" 2        # or by search — must match exactly one track
-vynull players                   # who's on the link and what they're playing
-vynull playlists                 # playlists with counts
-vynull status                    # server, analysis, and link state
-```
-
-All subcommands talk to `http://127.0.0.1:9443` by default; point them
-elsewhere with `--addr host:port` or `VYNULL_ADDR`. Listing commands take
-`--json`. Paths passed to `add` are resolved on the server's filesystem, so
-the client assumes the same host (or a shared mount).
-
-## Command-Line Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--interface` | (required) | Network interface (e.g., `eth1`) |
-| `--music-dir` | (optional) | Music directory to scan at startup |
-| `--mode` | `rekordbox` | Emulation mode: `rekordbox` or `cdj` (cdj needs UDP 111 — see Requirements) |
-| `--device-number` | `17` (rb) / `3` (cdj) | Device number on the network |
-| `--device-name` | auto | Name shown on CDJs |
-| `--data-dir` | `~/.vynull` | Directory for analysis cache, cue points, settings, library DB |
-| `--web` | `false` | Serve the browser UI alongside the JSON API |
-| `--mpris` | `true` | Publish the audible deck's now-playing on the D-Bus session bus (media controls, playerctl, KDE Connect); `--mpris=false` to disable |
-| `--tui` | `true` | Show the interactive terminal monitor; `--tui=false` runs headless (logs to stdout, for systemd/nohup/non-TTY) |
-| `--listen` | `127.0.0.1:9443` | API + web listen address (use `0.0.0.0:9443` to expose on the LAN) |
-| `--log-level` | `info` | `error`, `warn`, `info`, `debug`, or `trace` (trace adds per-packet hex dumps) |
-| `--log-file` | (auto) | Append logs to this file (default: a temp file while the TUI is shown, or stdout when headless) |
-| `--history-file` | (auto) | Append each completed play to one rolling history file (default: `<data-dir>/history.<ext>`) |
-| `--history-format` | `text` | Track-history format: `text`, `csv`, or `json` (JSONL — one object per line) |
-| `--lazy-analysis` | `false` | Analyze tracks on-demand instead of at startup |
-| `--transcode` | `false` | Transcode FLAC/WAV/AIFF to MP3 (default: serve natively) |
-| `--bpm-range` | (dance window) | Constrain BPM detection to a tempo range, e.g. `90-180`, so fast genres lock onto the true tempo instead of its half/third |
-| `--grid-offset` | `0` | Shift every detected beat grid by this many ms (negative = earlier); overrides the web setting for this session |
-| `--settings` | `<data-dir>/settings.json` | Path to the JSON CDJ settings config |
-| `--import-settings` | | Import rekordbox MYSETTING/DEVSETTING `.DAT` files from a `/PIONEER` dir, then exit |
-| `--generate` | | Generate rekordbox USB structure at this path (no server) |
-| `--copy-files` | `false` | Copy files when generating USB (default: symlink) |
-| `--export-playlist` | | With `--generate`, export only this playlist (by name) |
-| `--replay` | | Replay recorded response packets |
-| `--version` | | Print the version (release tag or dev commit) and exit |
-
-## HTTP API
-
-The API server runs on `http://127.0.0.1:9443`.
-
-The full surface is described by an OpenAPI spec served at `/api/openapi.yaml`, with a browsable Swagger UI at `/api/docs` (both always on, even headless). The endpoints below are a quick reference.
-
-An error keeps its HTTP status and answers `{"error": "message"}`. A write with nothing to return answers `{"ok": true}`.
-
-### Endpoints
-
-#### `GET /api/status`
-
-Returns device status, connected peers, and player states.
-
-#### `GET /api/tracks`
-
-Returns all tracks in the library with metadata. Its ETag follows the track list's revision, so a client revalidating with `If-None-Match` gets 304 while nothing changed; `GET /api/tracks/rev` returns that revision on its own, for cheap polling.
-
-#### `POST /api/tracks/add`
-
-Add tracks to the library. Accepts absolute file paths.
-
-```json
-{
-  "paths": [
-    "/path/to/track1.mp3",
-    "/path/to/track2.flac"
-  ]
-}
-```
-
-Response:
-
-```json
-{
-  "ok": true,
-  "added": 2,
-  "total": 15
-}
-```
-
-#### `POST /api/load`
-
-Remotely load a track on a CDJ. If `file_path` is provided and the track isn't in the library, it's automatically added and analyzed.
-
-```json
-{
-  "track_id": 5,
-  "device_number": 1
-}
-```
-
-Or by file path:
-
-```json
-{
-  "file_path": "/path/to/track.mp3",
-  "device_number": 2
-}
-```
-
-#### `GET /api/version`
-
-Returns the running build: `version` (release tag, or a Go pseudo-version between releases), `commit`, `date`, `dirty`, and `go_version`. Also shown at the right of the web UI's status bar and in DIAG's RUNTIME card, and printed by `vynull --version`.
-
-#### `GET /api/peers`
-
-Returns connected Pro DJ Link devices.
-
-#### `GET /api/players`
-
-Returns CDJ player states (playing, BPM, track, etc.).
-
-#### `GET /api/history`
-
-Returns track play history.
-
-### Library & Import Endpoints
-
-#### `POST /api/import/rekordbox`
-
-Import a rekordbox library. `multipart/form-data` with a `file` field — a
-`rekordbox.xml`, an encrypted `master.db`, or a library-backup `.zip`. The
-`key` field carries the 64-hex SQLCipher key, required for the encrypted
-`master.db`/`.zip` forms (XML needs none). Imports tracks, MyTags
-(+ categories), colors, (smart) playlists, cue points, ANLZ analysis, and
-artwork; returns counts plus a `files_missing` warning for tracks whose audio
-isn't present on this machine.
-
-#### `PUT /api/tracks/{trackID}/metadata`
-
-Edit free-text metadata in the library DB only (never the audio file). Send any
-subset of `label`, `remixer`, `original_artist`, `mix_name`, `comment`.
-
-#### `PUT /api/tracks/{trackID}/path`
-
-Repoint a track at a new file path (e.g. relink a moved file). Updates the
-library DB only, rekeys the analysis cache so existing waveforms/beat grid
-follow the track, and re-checks file presence.
-
-```json
-{"path": "/new/location/track.flac"}
-```
-
-#### `POST /api/library/remap-paths`
-
-Bulk-rewrite a file-path prefix across the whole library (e.g.
-`Z:/Music/` → `/media/usb/Music/`), rekeying analysis caches.
-
-```json
-{"from": "Z:/Music/", "to": "/media/usb/Music/"}
-```
-
-#### `POST /api/export`
-
-Write a rekordbox-compatible USB export (PDB + ANLZ + settings) from the
-library. `POST /api/export/preview` returns what would be written.
-
-### Analysis Endpoints
-
-#### `GET /api/analysis/{trackID}`
-
-Returns complete analysis data: beat grid, BPM, key, duration, cue points. Triggers on-demand analysis if data is missing or stale.
-
-```json
-{
-  "track_id": 12345,
-  "bpm": 130.0,
-  "key": "5A",
-  "key_standard": "Cm",
-  "duration_sec": 450,
-  "beat_count": 947,
-  "downbeat_index": 2,
-  "beats": [{"time_ms": 58.8, "beat_in_bar": 3}, ...],
-  "cues": [{"number": 1, "type": "cue", "time_ms": 4975, "color_id": 2}, ...]
-}
-```
-
-#### `GET /api/analysis/waveform/{trackID}?type=detail|preview|color_preview`
-
-Returns waveform data as JSON. Triggers on-demand analysis if data is missing or stale.
-
-- `detail` — decoded PWV5 (150 entries/sec with RGB+height). Add `&style=3band`
-  for the CDJ-3000 3-band representation (`{bass,mid,high}`) when available.
-- `color_preview` — decoded PWV4 (1200 entries with bass/mid/treble)
-- `preview` — raw PWAV bytes
-
-#### `GET /api/analysis/waveform-png/{trackID}?type=detail&color=rgb|blue|3band&overview=full|half&w=280&h=56`
-
-Returns a pre-rendered PNG (disk-cached) — used by the web UI's row thumbnails.
-`color` and `overview` mirror the CDJ waveform-color / overview settings.
-
-#### `GET /api/artwork/{trackID}`
-
-Returns the track's cover art (JPEG), extracted lazily from the file on first
-request and cached.
-
-#### `GET /api/artwork/ext/{player}/{slot}/{trackID}`
-
-Returns the cover art (JPEG) for a track a deck plays from another player's
-media, downloaded from that player's rekordbox export over NFS and cached. 404
-until the download lands (the PLAYERS view retries on its next poll) or when the
-track has no art.
-
-#### `GET /api/analysis/ext/{player}/{slot}/{trackID}`
-
-Returns the colour detail waveform and cue points (plus duration and BPM) for a
-track a deck plays from another player's media, parsed from that player's ANLZ
-files downloaded over NFS. 404 until the download lands or when the track has no
-analysis.
-
-#### `POST /api/analysis/beatgrid/adjust`
-
-Manually adjust the beat grid. All operations persist to the analysis cache and regenerate beat grid blobs.
-
-```json
-// Shift all beats earlier by 25ms
-{"track_id": 12345, "offset_ms": -25.0}
-
-// Set BPM to exactly 130 (rebuilds grid keeping same phase)
-{"track_id": 12345, "bpm": 130.0}
-
-// Set beat 1 at specific position (shifts grid + sets downbeat)
-{"track_id": 12345, "set_downbeat_ms": 4975.0}
-```
-
-### Cue Point Endpoints
-
-#### `GET /api/tracks/{trackID}/cues`
-
-Returns all cue points for a track.
-
-#### `POST /api/tracks/{trackID}/cues`
-
-Add or update a cue point.
-
-```json
-{
-  "number": 1,
-  "type": "cue",
-  "time_ms": 4975,
-  "loop_ms": -1,
-  "color_id": 2,
-  "label": "Drop"
-}
-```
-
-Color IDs: 0=default, 1=pink, 2=red, 3=orange, 4=yellow, 5=green, 6=aqua, 7=blue, 8=purple.
-
-#### `DELETE /api/tracks/{trackID}/cues/{number}`
-
-Delete a cue point by number (1=A, 2=B, 3=C, ...).
-
-#### `GET /api/cues` and `GET /api/cues/rev`
-
-Every track's cues, keyed by track ID, and the cue revision, which moves on every saved or deleted cue (from a deck or the API). `GET /api/cues` has an ETag on that revision, like the track list.
-
-### Tag Endpoints
-
-#### `GET /api/tags`
-
-Returns all user-defined tags.
-
-#### `POST /api/tags`
-
-Create a new tag.
-
-```json
-{"name": "Peak Time"}
-```
-
-#### `PUT /api/tags/{id}`
-
-Rename a tag.
-
-```json
-{"name": "Warm Up"}
-```
-
-#### `DELETE /api/tags/{id}`
-
-Delete a tag (removes from all tracks).
-
-#### `GET /api/tracks/{trackID}/tags`
-
-Returns tags assigned to a track.
-
-#### `POST /api/tracks/{trackID}/tags`
-
-Set tags for a track (replaces all existing).
-
-```json
-{"tag_ids": [1, 3]}
-```
-
-#### `GET /api/tracks/{trackID}/color`
-
-Returns the track's color ID.
-
-#### `POST /api/tracks/{trackID}/color`
-
-Set a track's color.
-
-```json
-{"color_id": 4}
-```
-
-#### Tag categories
-
-`GET/POST /api/tag-categories` and `PUT/DELETE /api/tag-categories/{id}` manage
-MyTag categories (Genre, Mood, …). Create a tag inside a category with
-`POST /api/tags {"name": "...", "category_id": N}`.
-
-### Playlist Endpoints
-
-#### `GET /api/playlists`
-
-Returns the playlist/folder tree (regular and smart playlists).
-
-#### `POST /api/playlists`
-
-Create a playlist, folder, or smart playlist. A smart playlist carries a
-rule set (combinator + conditions) that's evaluated live against the library.
-
-```json
-{
-  "name": "Peak Time",
-  "is_smart": true,
-  "rules": {"combinator": "all", "conditions": [
-    {"field": "bpm", "operator": "between", "value": [126, 132]},
-    {"field": "tag", "operator": "has", "value": "Energy"}
-  ]}
-}
-```
-
-#### `PUT /api/playlists/{id}` · `DELETE /api/playlists/{id}` · `GET /api/playlists/{id}/tracks`
-
-Rename/reparent/edit-rules, delete, and list a playlist's (resolved) tracks.
-
-### Settings Endpoints
-
-#### `GET /api/settings`
-
-Returns current CDJ display settings.
-
-```json
-{
-  "waveform_size": "full",
-  "waveform_color": "rgb",
-  "waveform_position": "center",
-  "key_display": "alphanumeric",
-  "track_detail": "artist"
-}
-```
-
-#### `POST /api/settings`
-
-Update CDJ display settings. Only include fields you want to change. Waveform settings are pushed to connected CDJs via the settings notification protocol.
-
-```json
-{"waveform_color": "3band", "track_detail": "bpm"}
-```
-
-Values:
-- `waveform_size`: `"full"` or `"half"`
-- `waveform_color`: `"blue"`, `"rgb"`, or `"3band"`
-- `waveform_position`: `"left"` or `"center"`
-- `key_display`: `"classic"` (Am, Eb) or `"alphanumeric"` (8A, 5B)
-- `track_detail`: field shown next to track titles when browsing on CDJ
-
-Track detail values:
-
-| Value | Displayed on CDJ |
-|-------|-----------------|
-| `"artist"` | Artist name (default) |
-| `"bpm"` | BPM and key (e.g., "126.0 bpm - 6A") |
-| `"key"` | Key and BPM (e.g., "6A - 126.0 bpm") |
-| `"album"` | Album name |
-| `"genre"` | Genre name |
-| `"label"` | Record label |
-| `"bitrate"` | Bitrate in kbps |
-| `"time"` | Track duration |
-| `"rating"` | Star rating |
-| `"color"` | Track color name |
-| `"comments"` | Comment text |
-| `"original_artist"` | Original artist |
-| `"remixer"` | Remixer name |
-| `"dj_play_count"` | Play count |
-| `"date_added"` | Date added (YYYY-MM-DD) |
-| `"none"` | No secondary field |
-
-## Architecture
-
-```
-vynull/
-  main.go              CLI entrypoint, flag parsing, orchestration
-  config.go            Config struct, defaults, validation
-  proto/               Packet encoding/decoding
-    header.go          Magic bytes, common header
-    announce.go        Announcement/keep-alive packets (UDP 50000)
-    status.go          CDJ/mixer status + refresh-trigger packets (UDP 50002)
-    cdj_status.go      Parse incoming CDJ status (play state, BPM, track)
-    dbmessage.go       Dbserver binary message encoding
-  device/              Virtual device lifecycle
-    device.go          Startup sequence, keep-alive loop, settings notification
-    peers.go           Track connected CDJs/mixers
-    monitor.go         Live player-state tracking + track history
-    tui.go             Terminal monitor UI (players/library/settings tabs)
-    settings.go        CDJ settings persistence (DEVSETTING/MYSETTING)
-    settings_schema.go Settings config that drives *SETTING.DAT + the web UI
-    settings_import.go Parse rekordbox *SETTING.DAT files on import
-  dbserver/            TCP metadata server (port 12523 + dynamic)
-    server.go          Listener, session handling, message framing, replay
-    handler.go         Message dispatcher, menu/metadata responses
-    render.go          0x3000 Render dispatcher + pending-item paging
-    categories.go      Top-level category lists (artists/albums/BPM/key/…)
-    drilldown.go       Multi-level drill + search (post-category)
-    menuitem.go        menuItem type, sort dispatch, track→item conversion
-    playlist.go        Playlist / folder menu handlers
-    linkhistory.go     Link history (HISTORY menu) and played state
-    track.go           Track detail + analysis (info/waveform/beat grid/PVB2/cues)
-    cuepoints.go       Cue point save/load/delete with wire format synthesis
-  nfs/                 Minimal NFS v2 server (read-only)
-    portmap.go         Portmapper
-    mount.go           Mount protocol
-    server.go          NFS v2 GETATTR/LOOKUP/READ/READDIR (path traversal protected)
-    rpc.go             Sun RPC / XDR framing (bounds-checked)
-    flac.go            Transparent FLAC/WAV/AIFF to MP3 transcoding
-  analysis/            Audio analysis
-    analysis.go        Pipeline, versioned cache, background workers, on-demand reanalysis
-    bpm.go             DP beat tracker, BPM estimation, phase alignment
-    beatgrid.go        Beat grid generation (PQTZ/PQT2 formats)
-    waveform.go        PWV4/PWV5 color waveform + monochrome generation
-    pqt2.go            PQT2 extended beat grid format
-    pvb2.go            PVB2 VBR seek index from the audio frame map (ffprobe)
-    pvbr.go            PVBR/PVB2 seek-index section builders
-    fft.go             Radix-2 Cooley-Tukey FFT
-    fft_batch.go       Parallel-CPU batch FFT
-    phrase.go          Song structure / phrase detection (PSSI)
-    vocal.go           Lightweight per-phrase vocal-presence detection
-    key.go             Musical key detection (chromagram + Pearson correlation)
-    decode.go          FFmpeg PCM audio decoding
-    render.go          Waveform preview → PNG rendering (web UI)
-    anlz.go            ANLZ file format (.DAT/.EXT/.2EX)
-    import_anlz.go     Reconstruct analysis from rekordbox ANLZ files on import
-    import_cues.go     Parse cue points from rekordbox ANLZ on import
-    artwork.go         Artwork extraction (embedded tags via ffmpeg)
-  library/             Music library (thread-safe)
-    scanner.go         Directory walk, tag reading
-    track.go           Track struct (matches rekordbox PDB fields)
-    index.go           In-memory indices, persistence, sequential IDs
-    update.go          Validated track edits that keep the indices in step
-    artwork.go         Artwork cache
-    thumbnail.go       JPEG thumbnail resizing (oversized CDJ artwork)
-    decode_check.go    ffmpeg decode-health check (flags CDJ-freezing files)
-    import_xml.go      Import a rekordbox.xml export (tracks, tags, colors)
-    import_masterdb.go Import an encrypted master.db / backup .zip (via rekordbox_dump.py)
-  api/                 HTTP API server
-    api.go             Server, routes, CORS middleware, JSON helpers
-    status.go          Status, peers, players, now playing, history, link
-    tracks.go          Track list, deck loads, track edits (metadata/path/color/rating)
-    imports.go         rekordbox import, path remap, adding + reimporting files
-    export.go          rekordbox USB export, with a preview
-    analysis.go        Analysis jobs, reanalysis, analysis + phrase endpoints
-    waveform.go        Waveform data + PNG rendering
-    artwork.go         Artwork endpoints
-    beatgrid.go        Beat grid edits, tempo overrides, analysis lock
-    cues.go            Cue endpoints
-    settings.go        Settings endpoint
-    menu.go            CDJ root-menu endpoints
-    tags.go            Tag + tag category endpoints
-    playlists.go       Playlist endpoints
-    fs.go              Sandboxed filesystem browser for "add files/folders"
-    diag.go            Log ring buffer + diagnostic endpoints (status/logs/stats)
-    web.go             //go:embed of the single-page web UI (served at GET /)
-    web/index.html     Browser-based library manager (UI): the page
-    web/css/, web/js/  its stylesheets and scripts, one file per feature
-    cueadapter.go      Bridge between API cue types and dbserver cue store
-    tagstore.go        User-defined tags, tag categories, track colors (batched saves)
-    playliststore.go   Playlist/folder tree + smart-playlist persistence
-    smart_playlist.go  Smart-playlist rule model + live evaluation
-    smart_import.go    Translate rekordbox SmartList rules → app rules
-    menustore.go       CDJ root-menu layout + track-detail column config
-  pdb/                 Pioneer database format
-    pdb.go             PDB parser
-    folders.go         Folder/playlist tree
-    settings.go        MYSETTING/DEVSETTING generation
-    artwork.go         Artwork USB path scheme + table rows
-    defaults.go        Default rows every export needs (colors/columns/menu)
-    writer.go          export.pdb file writer
-    writer_ext.go      exportExt.pdb extension-table writers (NXS2+ data)
-  internal/
-    fsutil/atomic.go   Atomic file writes (temp + fsync + rename) for the stores
-    netutil/netutil.go Interface discovery, broadcast addr
-  tools/
-    rekordbox_dump.py  Reads an encrypted rekordbox master.db (SQLCipher) for import
-```
-
-## Protocol Details
-
-### Network Ports
-
-| Port | Protocol | Purpose |
-|------|----------|---------|
-| 50000 | UDP | Device announcement and keep-alive |
-| 50001 | UDP | Beat packets |
-| 50002 | UDP | CDJ status, media queries, settings, link activation |
-| 12523 | TCP | Database server discovery (responds with dynamic port) |
-| (dynamic) | TCP | Database server (OS-assigned ephemeral port) |
-| 50111 | UDP | NFS portmapper |
-| 2049 | UDP | NFS v2 file server |
-| (dynamic) | UDP | NFS mount protocol |
-| 9443 | TCP | HTTP API server |
-
-### Menu Category Routing
-
-The CDJ derives query message types from root menu item IDs (`0x1000 + ID`):
-
-| ID | Category | Message Type |
-|----|----------|-------------|
-| 1 | Genre | 0x1001 |
-| 2 | Artist | 0x1002 |
-| 3 | Album | 0x1003 |
-| 4 | Track | 0x1004 |
-| 6 | BPM | 0x1006 |
-| 7 | Rating | 0x1007 |
-| 8 | Year | 0x1008 |
-| 9 | Remixer | 0x1009 |
-| 10 | Label | 0x100a |
-| 11 | Original Artist | 0x100b |
-| 12 | Key | 0x1014 |
-
-### Waveform Formats
-
-- **PWAV**: Mono preview waveform (dbserver: 200x2 height+whiteness + 200x2 + 100 + footer; ANLZ .DAT: 400 entries)
-- **PWV4**: Color preview waveform (1200 entries x 6 bytes: d0/d1=steepness, d2=low-half energy, d3=bass(R), d4=mid(G), d5=treble(B)). CDJ derives height: back=max(d3,d4,d5), front=d5. Color: each byte * 255 / max. Values are globally normalized (0-255 relative to track peak).
-- **PWV5**: Color detail waveform (150 points/sec, 2 bytes each, 16-bit big-endian: `RRRGGGBBBHHHHH00`)
-- **PWV6**: 3-band preview waveform (1200 entries x 3 bytes: mid, high, low). CDJ-3000 format, in .2EX files.
-- **PWV7**: 3-band detail waveform (150 points/sec x 3 bytes: mid, high, low). CDJ-3000 format, in .2EX files.
-- **Mono detail**: Non-color scrolling waveform (150 points/sec, 1 byte each: `brightness3 height5`)
-
-### Track Info Title ID (Audio Decoder Selection)
-
-The track info response title item ID tells the CDJ which audio decoder to use:
-
-| ID | Decoder | Formats |
-|----|---------|---------|
-| 1 | MP3 | MP3 |
-| 4 | AAC | M4A/AAC |
-| 5 | Lossless compressed | FLAC |
-| 11 (0x0b) | Raw PCM | WAV |
-| 12 (0x0c) | Raw PCM | AIFF |
-
-### Cue Points
-
-Cue points are saved and loaded via the dbserver protocol:
-
-- **Write**: CDJ sends type `0x2705` with 76-byte cue blob (LE, time in ms at offset 0x0c)
-- **Read**: CDJ requests type `0x2b04`, server responds with `0x4e02` containing concatenated cue blobs
-- **API-created cues**: Synthesized 76-byte blobs matching CDJ wire format
-- **Persistence**: Raw blobs saved to `<data-dir>/cues/` alongside parsed JSON metadata
-
-### Settings Notification Protocol
-
-When settings are changed via the API:
-
-1. Server sends `0x4a` (settings notification) to CDJ
-2. CDJ responds with `0x46` (link ack)
-3. Server sends `0x47` (link activation) with DEVSETTING bytes embedded at offset 0x30
-
-DEVSETTING layout (6 bytes): `[unknown, overview_type, waveform_color, unknown, key_display, wave_position]`
-
-## Supported Audio Formats
-
-| Format | Direct NFS | Transcoded (with `--transcode`) |
-|--------|-----------|------|
-| MP3 | Yes | - |
-| M4A/AAC | Yes | - |
-| FLAC | Yes | to MP3 |
-| WAV | Yes | to MP3 |
-| AIFF | Yes | to MP3 |
-
-By default, all formats are served natively. FLAC/WAV/AIFF use the appropriate decoder ID in the track info response so the CDJ selects the correct decoder. Pass `--transcode` to convert lossless formats to MP3 if needed.
-
-## Troubleshooting
-
-General questions about the project live at
-[vynull.dev/#faq](https://vynull.dev/#faq). The three problems people hit
-most:
-
-- **Blank scrolling waveform on the CDJ** — known deck quirk with network
-  sources: toggle the deck's waveform-color setting once and it renders from
-  then on.
-- **Whole library re-analyzing after an upgrade** — expected, once per
-  release that improves the analysis (the cache version is bumped so existing
-  libraries get the improvements, not just new tracks). It runs in the
-  background as tracks are viewed or loaded.
-- **CDJs silently stop loading tracks** — usually two rekordbox sources on
-  the network (real rekordbox running alongside Vynull); the log warns when
-  this collision is detected. Close one of them.
-
-For anything else, run with `--log-level debug` (or `trace` for wire-level
-hex dumps) and attach the log to a bug report — the default level keeps logs
-quiet, so debug logs say a lot more.
-
-## Acknowledgements
-
-This wouldn't exist without the people who reverse-engineered Pioneer's Pro DJ Link protocol and rekordbox's file formats and then published what they found. Most of what this project knows, it learned from their work:
-
-- **[Deep Symmetry](https://deepsymmetry.org/)** (James Elliott and contributors) — by far the biggest source. The [dysentery](https://github.com/Deep-Symmetry/dysentery) research and its [protocol writeup](https://djl-analysis.deepsymmetry.org/), the [beat-link](https://github.com/Deep-Symmetry/beat-link) library, [crate-digger](https://github.com/Deep-Symmetry/crate-digger), and the Kaitai specs (`rekordbox_pdb.ksy`, `rekordbox_anlz.ksy`) are behind most of the protocol, PDB, and ANLZ code here.
-- **[rekordcrate](https://github.com/Holzhaus/rekordcrate)** (Jan Holthuis) — Rust parsers and reference exports I leaned on to get the `export.pdb` writer byte-for-byte right.
-- **[python-prodj-link](https://github.com/flesniak/python-prodj-link)** (Florian Sniak) — a working Python implementation that helped me understand the dbserver menu and metadata flow.
-- **[prolink-connect](https://github.com/EvanPurkhiser/prolink-connect)** and **[prolink-tools](https://github.com/EvanPurkhiser/prolink-tools)** (Evan Purkhiser) — a TypeScript Pro DJ Link stack and streaming overlay; alongside crate-digger they confirmed the route for reading metadata off tracks a deck plays from its own USB (download the player's `export.pdb` over NFS rather than asking its dbserver).
-- **[link-spec](https://github.com/evanpurkhiser/link-spec)** (Evan Purkhiser) — a dbserver conformance suite that replays rekordbox's own menu responses as goldens. Running Vynull against it surfaced hundreds of wire-format divergences from rekordbox that would have been impractical to find by hand, and is driving the dbserver toward byte-for-byte parity across the menu queries.
-- **[pyrekordbox](https://github.com/dylanljones/pyrekordbox)** (Dylan Jones) — format docs and the starting point for decrypting `master.db`.
-- The Kaitai Struct community for the format definitions, and everyone who posted issues and helped along the way.
-- **Audio-analysis algorithms** — the beat tracker is an independent implementation of D. Ellis's dynamic-programming method (*"Beat Tracking by Dynamic Programming"*, J. New Music Research, 2007); key detection uses the Krumhansl-Kessler probe-tone profiles (1982). These are published academic methods — the same DP beat-tracking approach is also implemented by [QM-DSP](https://github.com/c4dm/qm-dsp) and [Mixxx](https://github.com/mixxxdj/mixxx), which are worth a look, though the code here derives from the papers rather than those projects.
-
-A few things aren't covered by the documented specs — the on-the-wire settings handshake, NXS2 cue writes, and some of the waveform encodings — and were worked out independently; the settings *file-format* field schema and the ANLZ section framing still follow the documented specs above. Without the projects listed here there'd have been nowhere to start. Thanks to everyone listed.
-
-This is an independent, unofficial project. It isn't affiliated with or endorsed by Pioneer DJ / AlphaTheta, Deep Symmetry, or any of the projects listed here.
-
-## Contributors
-
-Thanks to the people who have contributed code, fixes, and reports to Vynull directly:
-
-- **[@kayrozen](https://github.com/kayrozen)** — the web audio player, and the master.db import's automatic sqlcipher venv provisioning, both via fork and PR.
-- **[@evanpurkhiser](https://github.com/evanpurkhiser)** — pointing Vynull at [link-spec](https://github.com/evanpurkhiser/link-spec) and the enormous groundwork of the conformance suite itself, which drove the dbserver to byte-for-byte parity with rekordbox (and, along the way, fixed a long-standing track-load bug).
-
-Plus everyone who has filed a report or a patch (see each release's notes for per-version credits).
-
-## License
-
-Vynull is free software licensed under the **GNU General Public License v3.0**
-(GPLv3) — see [`LICENSE`](LICENSE). You're free to use, study, share, and
-modify it under those terms; derivative works must also be GPLv3.
-
-Copyright (C) 2026 the Vynull authors.
-
-A few small portions derive from third-party reverse-engineering work and carry
-their own upstream provenance (noted inline in the source):
-
-- Default PDB table bytes (`pdb/defaults.go`) are rekordbox's own export output,
-  captured by [rekordcrate](https://github.com/Holzhaus/rekordcrate) (MPL-2.0).
-- The PSSI obfuscation constant (`analysis/phrase.go`) is a format constant from
-  Deep Symmetry's Kaitai spec ([crate-digger](https://github.com/Deep-Symmetry/crate-digger),
-  EPL-2.0 with an LGPL-3.0 secondary option).
-- File-format layouts and protocol field offsets throughout are interoperability
-  facts documented by the projects in [Acknowledgements](#acknowledgements).
-
-The original code in this project is GPLv3; the items above are noted for
-provenance and interoperability.
+`LAB_PYTHON` picks the interpreter the review service uses for lab jobs (default `lab/.venv/bin/python`).
+`VYNULL_LAB_DIR` moves the lab (default `lab/`). The first planner run downloads the CLAP model from Hugging Face.
+Set `HF_HUB_OFFLINE=1` to forbid that, or `VYNULL_HF_CACHE` to pick the cache folder.
+
+**Bundled models** (`*/artifacts/*.joblib`, `bar_phase_v1/bar_phase.joblib`) are small scikit-learn models
+trained on the **[Raveform](https://huggingface.co/datasets/taejunkim/raveform)** dataset (CC BY 4.0, Taejun Kim)
+and contain no personal data. They're pickles, so load them only if you trust this repo, and use scikit-learn
+1.9.x. `bar_phase_v1/*.json` hold that model's protocol and integrity locks. `inference.py` refuses to run if the
+model or feature code changes.
+
+Everything here is **experimental**. Previews are listening candidates, not claims of mix quality.
+
+## License and credits
+
+GPL-3.0-or-later, same as upstream (see [LICENSE](LICENSE)). This is a modified version of Vynull by vynulldev
+(upstream commit `282e80bc91d58445e85a2077412953b970140b38`). The first commit in this repo is that upstream
+tree unchanged, and later commits are the modifications. Protocol and format work credited in
+[README.upstream.md](README.upstream.md#acknowledgements). The bundled models are derived from Raveform (CC BY 4.0). The CLAP model is
+`laion/larger_clap_music`, Demucs is by Meta (MIT), and librosa is ISC.

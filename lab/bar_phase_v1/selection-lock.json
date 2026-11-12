@@ -1,0 +1,28 @@
+{
+  "model_sha256": "d7077ebdef66df5a52d47ff1cca75c66ba10f382bb84208dfce22fdb38d6da1f",
+  "protocol_sha256": "f80de2a0bd73c7e9c38b1fd5ac19a61b63c1b032a8a42cc8cab0dc89b373ec28",
+  "feature_code_sha256": "80715644f137b4f2440a0717b25d8da52c2f75775539353ea37a2494d6522084",
+  "training_code_sha256": "e40dbf4cb9440d197c599ae314e59b086b5a5d8b12ccd867cd9493cf549e913f",
+  "selection_sha256": "5a4f9be072a1a4792d6bb99660be2a41bbc555ac9066aa8451fd346e8131fff5",
+  "selected": {
+    "leaves": 15,
+    "temperature": 1,
+    "metrics": {
+      "tracks": 100,
+      "windows": 5178,
+      "track_weighted_accuracy": 0.6705172472112905,
+      "log_loss": 0.8121957255250869,
+      "automatic_phase_zero_accuracy": 0.8557611926561596,
+      "phase_counts": {
+        "0": 4390,
+        "1": 307,
+        "2": 258,
+        "3": 223
+      }
+    }
+  },
+  "correction_threshold": 0.8,
+  "validation_gate_passed": true,
+  "created": 1793704341.1736042,
+  "test_predictions_run": false
+}

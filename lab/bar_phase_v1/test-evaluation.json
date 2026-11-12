@@ -1,0 +1,42 @@
+{
+  "model_sha256": "d7077ebdef66df5a52d47ff1cca75c66ba10f382bb84208dfce22fdb38d6da1f",
+  "phase_model": {
+    "tracks": 106,
+    "windows": 5055,
+    "track_weighted_accuracy": 0.6815880864793664,
+    "log_loss": 0.8004836829629166,
+    "automatic_phase_zero_accuracy": 0.8656618709509115,
+    "phase_counts": {
+      "0": 4372,
+      "1": 230,
+      "2": 251,
+      "3": 202
+    }
+  },
+  "selected_gate": {
+    "threshold": 0.8,
+    "wrong_claim_coverage": 0.23829126897319866,
+    "corrected_claim_precision": 0.9668231427777393,
+    "healthy_claim_false_change": 0.011858633112052718,
+    "natural_automatic_accuracy": 0.8850785572756732,
+    "natural_baseline_accuracy": 0.8656618709509115,
+    "natural_improvement": 0.019416686324761644,
+    "natural_change_fraction": 0.04154715844325247
+  },
+  "track_bootstrap_improvement_95_ci": [
+    0.001551690723959436,
+    0.03975973749261039
+  ],
+  "validation_gate_passed": true,
+  "offline_correction_gate_passed": true,
+  "preview_correction_enabled": false,
+  "library_grids_modified": false,
+  "task": "Four-beat downbeat phase on clean automatic beat correspondences; not listener-rated mixing quality.",
+  "limitations": [
+    "Source partitions were used by earlier timing/structure experiments; this is a new-task held-out benchmark, not an untouched overall project confirmation.",
+    "A pre-fit metadata audit inspected split sizes and phase counts, not any phase-model predictions.",
+    "Only clean one-to-one automatic/manual beat correspondences are evaluated; inference needs the same grid-regularity guard.",
+    "Four-beat meter assumed. EDM corpus transfer to other styles remains unproven."
+  ],
+  "seconds": 132.50260424613953
+}
